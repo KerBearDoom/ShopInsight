@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      目前是独立模块。等阶段 1 做多模块重构时，这里加一个 <parent> 指向
+      shop-insight 父 POM 即可，代码不用动。
+    -->
+    <groupId>com.company</groupId>
+    <artifactId>shop-insight-job</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>jar</packaging>
+    <name>shop-insight-job</name>
+    <description>Flink / Spark 计算任务</description>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <flink.version>2.3.0</flink.version>
+        <!--
+          注意这个后缀：-2.2 表示它是为 Flink 2.2 构建的。
+          Maven 上目前没有 2.3 版本，这是最小测试要验证的核心风险点。
+        -->
+        <flink.kafka.connector.version>5.0.0-2.2</flink.kafka.connector.version>
+        <clickhouse.jdbc.version>0.10.0</clickhouse.jdbc.version>
+        <!--
+          官方支持矩阵里写的是 Flink 2.0.0 / 2.0.1，而集群是 2.3.0。
+          又是小版本差，和 Kafka 连接器同一类问题 —— 实测确认。
+        -->
+        <flink.clickhouse.connector.version>0.2.0</flink.clickhouse.connector.version>
+    </properties>
+
+    <dependencies>
+        <!-- Flink 核心由集群提供，不打进 fat jar -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-streaming-java</artifactId>
+            <version>${flink.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-clients</artifactId>
+            <version>${flink.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Kafka 连接器不在 Flink 镜像里，必须打进 fat jar -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-kafka</artifactId>
+            <version>${flink.kafka.connector.version}</version>
+        </dependency>
+
+        <!--
+          Flink 连接器基类。ClickHouseAsyncSink 继承的 AsyncSinkBase 在这个包里。
+          它既不在 ClickHouse 连接器的 -all 包里，也不在 Flink 镜像的 /opt/flink/lib 里
+          （镜像只带了 flink-connector-files），所以必须打包进来。
+        -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-base</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+
+        <!--
+          ClickHouse 官方 Flink 连接器。注意 groupId 是 com.clickhouse.flink，
+          不是 com.clickhouse —— 后者下面没有这个包。
+          -all 包已经内嵌了 ClickHouse Java 客户端，不需要再单独引驱动。
+        -->
+        <dependency>
+            <groupId>com.clickhouse.flink</groupId>
+            <artifactId>flink-connector-clickhouse-2.0.0</artifactId>
+            <version>${flink.clickhouse.connector.version}</version>
+            <classifier>all</classifier>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 打 fat jar：把 Kafka 连接器和 ClickHouse 驱动一起装进去 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.company.shopinsight.job.KafkaToClickHouseJob</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

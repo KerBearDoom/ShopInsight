@@ -1,0 +1,203 @@
+# =============================================================================
+# ShopInsight 本地基础组件
+#
+# 设计说明：
+#   - 只有 Kafka 和 ClickHouse 跑在 Docker 里。MySQL / Redis / Spark 用本机已装的服务
+#     （本机 MySQL 占着 3306、Redis 占着 6379，所以这里不重复起）。
+#   - Flink 的部署方式尚未决定（Docker 或本地），定下来后再加。
+#   - 应用（Spring Boot）跑在宿主机，不在容器里，所以 Kafka / ClickHouse 的端口
+#     直接映射到 localhost，用默认端口即可。
+#
+# 用法：
+#   docker compose up -d        启动
+#   docker compose ps           查看状态
+#   docker compose logs -f      看日志
+#   docker compose down         停止（保留数据）
+#   docker compose down -v      停止并删除数据卷
+# =============================================================================
+
+name: shop-insight
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Kafka 4.3.1 —— KRaft 模式，单节点兼任 broker + controller，不需要 ZooKeeper
+  # 该 tar 包导入后仓库名丢失，需先执行：
+  #   docker tag <IMAGE_ID> apache/kafka:4.3.1
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: shop-insight-kafka
+    restart: unless-stopped
+
+    ports:
+      # 宿主机上的 Spring Boot 通过 localhost:9092 连接
+      - "9092:9092"
+
+    environment:
+      # KRaft 集群标识。官方镜像强制要求，且首次格式化后不可更改，
+      # 必须和已持久化的数据卷保持一致，否则启动会失败。
+      CLUSTER_ID: _PR1hN5xQBGaG0vPECSyIA
+
+      # 单节点同时承担 broker 和 controller 两种角色
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+
+      # 双监听器：EXTERNAL 给宿主机（Spring Boot 用），INTERNAL 给容器之间（Flink 用）。
+      #
+      # 为什么必须分开：Kafka 返回给客户端的是 advertised 地址，不是它连的地址。
+      # 如果只配 localhost:9092，Flink 容器连上 kafka:9092 后会拿到
+      # "数据在 localhost:9092" 的元数据 —— 而那个 localhost 在它自己的
+      # 容器里指向它自己，连接必然失败。所以容器间必须走一个专属的地址。
+      KAFKA_LISTENERS: EXTERNAL://:9092,INTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # 单节点，所有内部 topic 的副本因子必须是 1，否则创建 topic 会失败
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # 开发期方便：埋点 topic 由生产者自动创建，不用手动建
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      # 限制堆内存（本机总共 16GB，Docker 只分到 ~7.75GB）
+      KAFKA_HEAP_OPTS: "-Xmx1G -Xms512M"
+
+      # 显式指定数据目录，与下面的卷挂载点保持一致。
+      #
+      # 不写这个会有坑：镜像里同时存在 /tmp/kraft-combined-logs、
+      # /tmp/kraft-broker-logs、/tmp/kafka-logs 三个候选路径，而运行时
+      # 真正生效的是 /tmp/kafka-logs。如果卷挂到了别的路径上，数据会写进
+      # 容器未挂载的临时目录 —— 容器一重建，topic 全部丢失，而且不报任何错。
+      # /var/lib/kafka/data 是这个镜像自己声明的卷路径。
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+    mem_limit: 1536m
+
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+    networks:
+      - shop-insight-net
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse 24.3.18.7 —— 列式存储，存放清洗后的行为明细与聚合指标
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: shop-insight-clickhouse
+    restart: unless-stopped
+
+    ports:
+      - "8123:8123"   # HTTP 接口（JDBC 走这个）
+      - "9000:9000"   # 原生 TCP 协议
+
+    environment:
+      # 启动时自动建库，省得手动 CREATE DATABASE
+      CLICKHOUSE_DB: shop_insight
+
+      # 这两个必须显式设置，不能省。
+      # 镜像的 entrypoint 有个坑：如果既没设 CLICKHOUSE_USER 也没设
+      # CLICKHOUSE_PASSWORD，它会把 default 用户限制为只能从 127.0.0.1 连接。
+      # 结果就是容器内 clickhouse-client 能连、宿主机通过映射端口连不进来，
+      # 而且报的是 "Authentication failed"（网络受限被伪装成认证失败），
+      # 非常容易误判成密码错了。
+      # 本地开发用，生产环境须换强密码并走密钥管理。
+      CLICKHOUSE_USER: shop_insight
+      CLICKHOUSE_PASSWORD: shop_insight
+
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+
+    # ClickHouse 对文件描述符要求较高，不放开会有性能告警
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+    mem_limit: 2048m
+
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client -u shop_insight --password shop_insight --query 'SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+    networks:
+      - shop-insight-net
+
+  # ---------------------------------------------------------------------------
+  # Flink 2.3.0 —— 实时计算。JobManager 管调度，TaskManager 干活，两个都要起
+  #
+  # 内存配额是按你 Docker 的实际上限（~7.75GB）倒推的：
+  #   本文件四个服务的 mem_limit 合计约 6.6GB，留了余量。
+  #   Flink 的 *.memory.process.size 是「整个进程」的内存，mem_limit 比它
+  #   稍高一点是给 JVM 自身开销留的，两个值不要配成一样。
+  # ---------------------------------------------------------------------------
+  jobmanager:
+    image: apache/flink:2.3.0
+    container_name: shop-insight-jobmanager
+    restart: unless-stopped
+
+    # 这个官方镜像靠 command 区分角色：jobmanager / taskmanager
+    command: jobmanager
+
+    ports:
+      - "8081:8081"   # Web UI，也是提交作业用的 REST 端点
+
+    environment:
+      # FLINK_PROPERTIES 里的内容会被写进 flink-conf.yaml
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 1024m
+
+    mem_limit: 1280m
+
+    networks:
+      - shop-insight-net
+
+  taskmanager:
+    image: apache/flink:2.3.0
+    container_name: shop-insight-taskmanager
+    restart: unless-stopped
+    command: taskmanager
+    depends_on:
+      - jobmanager
+
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 1536m
+
+    # 作业代码（含 Kafka 连接器）以 shaded fat jar 的形式提交，
+    # 由 Flink 的 child-first 类加载器加载，不需要额外往 /opt/flink/lib 挂 jar。
+    mem_limit: 1792m
+
+    networks:
+      - shop-insight-net
+
+volumes:
+  kafka-data:
+  clickhouse-data:
+  clickhouse-logs:
+
+networks:
+  shop-insight-net:
+    driver: bridge
