@@ -1,25 +1,28 @@
 # ShopInsight
 
-> 基于大数据的电商商家经营决策平台
+> 基于大数据的电商用户行为分析平台
 
-面向电商平台**商家（卖家）**的数据分析平台。商家打开 App 能看到「我的店铺今天谁来了、看了什么、为什么没买、我该怎么做」。
+面向电商**商家经营决策**的数据分析平台：看清流量从哪来、在哪一环流失、哪些商品有吸引力。
 
-技术上是完整的 Lambda 架构：App 端埋点采集行为数据 → Kafka 承接事件流 → Flink 实时清洗与计算 → ClickHouse 存储多维分析结果 → Spark 离线计算转化漏斗与用户分群 → Spring Boot 提供 REST API → 移动端展示。
+技术上是一条完整的 Lambda 链路：埋点数据经 Kafka 承接 → Flink 实时清洗与计算 → ClickHouse 支撑多维分析 → Spark 离线计算经营指标 → Spring Boot 提供 REST API → 移动端展示。
 
 ---
 
-## ⚠️ 当前状态
-
-**项目处于起步阶段**，目前只有 Spring Boot 骨架，尚无业务功能。本 README 描述的是**目标架构**，实际落地进度见下表。
+## 当前进度
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | 0 | 环境搭建（Docker / Maven / JDK） | ✅ 完成 |
-| 1 | 多模块骨架 + 数据模型设计 | 🚧 进行中 |
-| 2 | 采集 → 清洗 → 存储（Kafka / Flink / ClickHouse） | ⬜ 未开始 |
-| 3 | 实时计算 + REST API | ⬜ 未开始 |
-| 4 | 离线计算 + 商家经营指标（Spark） | ⬜ 未开始 |
+| 1 | 表结构设计 | ✅ 完成 |
+| 1 | 多模块骨架拆分 | ⬜ 未开始 |
+| 2 | Kafka → Flink → ClickHouse 链路 | ✅ **已跑通** |
+| 2 | 全量数据导入（1 亿行） | ⬜ 未开始 |
+| 2 | Checkpoint / exactly-once | ⬜ 未开始 |
+| 3 | 实时窗口计算 + REST API | ⬜ 未开始 |
+| 4 | Spark 离线计算（漏斗 / 留存 / 分群） | ⬜ 未开始 |
 | 5 | 移动端展示 | ⬜ 未开始 |
+
+**已可运行**：`docker compose up -d` 拉起 4 个容器，提交 Flink 作业后，Kafka 中的行为数据会经清洗落入 ClickHouse。链路已实测验证（含脏数据过滤）。
 
 ---
 
@@ -44,7 +47,7 @@
 └─────────────────────────────────────────────────────────────┘
                               ↑
 ┌─────────────────────────────────────────────────────────────┐
-│  数据源   Java 埋点模拟器 + MySQL 业务库                       │
+│  数据源   UserBehavior 行为数据集                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,17 +57,64 @@
 
 ## 技术栈
 
-| 层 | 技术 | 版本 |
+| 层 | 技术 | 版本 | 运行位置 |
+|---|---|---|---|
+| 语言 | Java | 17 | — |
+| 构建 | Maven | 3.9 | — |
+| 后端 | Spring Boot | 3.5.15 | 本地 |
+| 消息队列 | Apache Kafka（KRaft） | 4.3.1 | Docker |
+| 实时计算 | Apache Flink（Java API） | 2.3.0 | Docker |
+| 分析存储 | ClickHouse | 24.3.18.7 | Docker |
+| 业务库 | MySQL | 26.7.0 | 本地 |
+| 缓存 | Redis | 8.10.1 | 本地 |
+| 离线计算 | Apache Spark（Java API） | 4.2.0 | 本地 |
+
+> **Flink 2.x 说明**：Flink 2.0 是一次破坏性大版本更新，`SourceFunction` / `SinkFunction` 已移入 `legacy` 包，`FlinkKafkaConsumer` 被 `KafkaSource` 取代 —— 网上多数教程仍是 1.x 写法，不可直接套用。
+
+---
+
+## 数据源
+
+[UserBehavior 数据集](https://tianchi.aliyun.com/dataset/649)（阿里天池）：**3.4 GB / 100,150,807 行**，时间跨度 2017-11-25 ~ 2017-12-03。
+
+无表头，5 列：
+
+| 列 | 含义 |
+|---|---|
+| user_id | 用户 ID |
+| item_id | 商品 ID |
+| category_id | 商品类目 ID |
+| behavior_type | 行为类型 |
+| timestamp | Unix 秒级时间戳 |
+
+**行为类型只有 4 种**：
+
+```
+pv（浏览） → fav（收藏）/ cart（加购） → buy（购买）
+```
+
+⚠️ 数据集中**没有独立的「下单」和「支付」事件**，购买即 `buy` 一步到位，因此漏斗是三段而非通常设想的五六段。
+
+⚠️ 数据集**不含店铺维度**（只有 `category_id`），也**不含用户人口属性**。因此当前经营单元是**类目**而非店铺；店铺视角需要另外合成 `item → shop` 映射，属于后续工作。
+
+**数据质量**：抽样 500 万行扫描，仅 23 行时间戳异常（约 0.0005%），无空字段、无格式错误。异常值在 Flink 清洗层过滤。
+
+---
+
+## 表结构
+
+见 [`sql/clickhouse/01_schema.sql`](sql/clickhouse/01_schema.sql)。
+
+| 层 | 表 | 内容 |
 |---|---|---|
-| 语言 | Java | 17 |
-| 构建 | Maven（多模块） | 3.9 |
-| 后端 | Spring Boot | 3.5.15 |
-| 消息队列 | Apache Kafka（KRaft） | 3.7.0 |
-| 实时计算 | Apache Flink（Java API） | 1.20.1 |
-| 离线计算 | Apache Spark（Java API，本地模式） | 4.2.0 |
-| 分析存储 | ClickHouse | — |
-| 业务库 | MySQL | — |
-| 缓存 | Redis（Jedis） | 5.2.0 |
+| DWD | `dwd_user_behavior` | 清洗后的行为明细，按天分区 |
+| ADS | `ads_funnel_daily` | 每日转化漏斗 |
+| ADS | `ads_item_stats` | 商品维度表现 |
+| ADS | `ads_category_stats` | 类目维度表现 |
+| ADS | `ads_active_user_daily` | 每日活跃用户 |
+| ADS | `ads_realtime_pv_uv` | 实时 PV/UV（Flink 窗口写入） |
+
+**时区约定**：派生列显式使用 `Asia/Shanghai`。ClickHouse 服务器默认 UTC，而数据集是淘宝的 —— 按 UTC 分天会把「一天」切成北京时间 8 点到次日 8 点，「每日活跃」这类指标就失真了。
 
 ---
 
@@ -72,49 +122,21 @@
 
 ```
 shop-insight/
-├── shop-insight-common/     公共工具、统一响应体、异常定义
-├── shop-insight-dao/        数据访问（ClickHouse / MySQL / Redis）
-├── shop-insight-service/    业务逻辑
-├── shop-insight-web/        Spring Boot 启动模块 + REST API
-└── shop-insight-job/        Flink / Spark 计算任务（独立提交）
+├── shop-insight-job/        Flink / Spark 计算任务（独立提交）
+├── sql/clickhouse/          ClickHouse 建表脚本
+├── docker-compose.yml       Kafka + ClickHouse + Flink
+└── src/                     Spring Boot 骨架
 ```
 
-依赖单向流动：`web → service → dao → common`；`job` 仅依赖 `common`。
-
-> 模块拆分尚在进行中，当前仓库还是单模块结构。
-
----
-
-## 数据模型
-
-### 行为事件
-
-埋点协议覆盖完整转化漏斗，这是所有商家指标的算力来源：
+目标多模块结构（拆分进行中）：
 
 ```
-view（浏览） → click（点击） → add_cart（加购） → order（下单） → pay（支付）
-                                                      ↓
-                                                 refund（退款）
+shop-insight-common/     公共工具、统一响应体
+shop-insight-dao/        数据访问（ClickHouse / MySQL / Redis）
+shop-insight-service/    业务逻辑
+shop-insight-web/        Spring Boot 启动模块 + REST API
+shop-insight-job/        Flink / Spark 计算任务
 ```
-
-### 数据分层
-
-| 层 | 表 | 内容 |
-|---|---|---|
-| ODS | 原始埋点日志 | JSON 格式，本地磁盘归档 |
-| DWD | `dwd_user_behavior` | 清洗后的行为明细（ClickHouse） |
-| DWS | `dws_user_daily` | 按天 / 按用户聚合的宽表 |
-| ADS | `ads_*` | 面向应用的结果表（实时指标、漏斗、用户分群） |
-
-### 商家侧核心指标
-
-| 指标 | 计算方式 |
-|---|---|
-| 商品流量看板 | 按商品聚合 PV/UV、停留时长、跳出率 |
-| 转化漏斗 | 六个事件各环节的转化率，定位流失点 |
-| 用户画像 | 按性别 / 年龄 / 地域 / 消费能力切分受众 |
-| 复购与留存 | 同一用户多次支付的时间间隔 |
-| 实时热销榜 | 滑动窗口内按商品聚合成交额 |
 
 ---
 
@@ -122,33 +144,57 @@ view（浏览） → click（点击） → add_cart（加购） → order（下�
 
 ### 环境要求
 
-- JDK 17
-- Maven 3.9+
-- Docker Desktop（用于运行 Kafka / Flink / ClickHouse / MySQL / Redis）
+- JDK 17、Maven 3.9+
+- Docker Desktop（运行 Kafka / ClickHouse / Flink）
+- 本机 MySQL 与 Redis（也可改由 Docker 承载）
 
-### 构建
+### 启动基础设施
 
 ```bash
-git clone git@github.com:KerBearDoom/ShopInsight.git
-cd ShopInsight
+docker compose up -d
+docker compose ps
+```
+
+启动 4 个容器：
+
+| 容器 | 端口 |
+|---|---|
+| shop-insight-kafka | 9092 |
+| shop-insight-clickhouse | 8123（HTTP）、9000（原生） |
+| shop-insight-jobmanager | 8081（Flink Web UI） |
+| shop-insight-taskmanager | — |
+
+### 建表
+
+```bash
+docker exec -i shop-insight-clickhouse clickhouse-client \
+  -u shop_insight --password shop_insight --multiquery < sql/clickhouse/01_schema.sql
+```
+
+### 构建并提交 Flink 作业
+
+```bash
+cd shop-insight-job
 mvn clean package
+docker cp target/shop-insight-job-0.0.1-SNAPSHOT.jar shop-insight-jobmanager:/tmp/job.jar
+docker exec shop-insight-jobmanager /opt/flink/bin/flink run -d /tmp/job.jar
 ```
 
-当前骨架可直接启动：
-
-```bash
-java -jar shop-insight-web/target/*.jar
-```
+Flink Web UI：http://localhost:8081
 
 ---
 
 ## 路线图
 
 - [x] 环境搭建
-- [ ] 多模块骨架 + 埋点数据模型
-- [ ] Kafka 埋点模拟器 + Flink 实时清洗 → ClickHouse
-- [ ] 实时窗口计算（PV/UV、热销榜）+ REST API
+- [x] ClickHouse 表结构设计
+- [x] Kafka → Flink → ClickHouse 链路打通
+- [ ] 开启 checkpoint，实现失败恢复
+- [ ] 全量数据导入（1 亿行）
+- [ ] Flink 窗口计算（实时 PV/UV、热销榜）
+- [ ] Spring Boot REST API
 - [ ] Spark 离线计算（转化漏斗、复购、用户分群）
+- [ ] 多模块拆分
 - [ ] 移动端数据看板
 - [ ] 调度与监控
 
