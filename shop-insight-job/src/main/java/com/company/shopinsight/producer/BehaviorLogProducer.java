@@ -62,12 +62,13 @@ public class BehaviorLogProducer {
     /** 固定发到 0 号分区，保证流是有序的。理由见 sendBatch 的注释。 */
     private static final int PRODUCER_PARTITION = 0;
 
-    /** 按第 5 列（时间戳）升序。 */
-    private static final Comparator<String> BY_TIMESTAMP = (a, b) -> {
-        long ta = timestampOf(a);
-        long tb = timestampOf(b);
-        return Long.compare(ta, tb);
-    };
+    /**
+     * 按第 1 列（event_time）升序。
+     *
+     * <p>直接比较字符串即可：源格式是 {@code 2019-11-01 00:00:00 UTC}，
+     * 年月日时分秒都是零填充的，所以字典序等于时间序，不用解析成数字。
+     */
+    private static final Comparator<String> BY_TIMESTAMP = (a, b) -> timeKey(a).compareTo(timeKey(b));
 
     public static void main(String[] args) throws Exception {
         String csvPath = args.length > 0 ? args[0] : "/Users/kerbear/Desktop/Project_IV/UserBehavior.csv";
@@ -169,22 +170,52 @@ public class BehaviorLogProducer {
         return batch.size();
     }
 
-    private static long timestampOf(String line) {
-        int lastComma = line.lastIndexOf(',');
-        try {
-            return Long.parseLong(line.substring(lastComma + 1).trim());
-        } catch (NumberFormatException e) {
-            return Long.MAX_VALUE; // 解析不了的排到最后
-        }
+    /** 取第 1 列（event_time）作为排序键。 */
+    private static String timeKey(String line) {
+        int comma = line.indexOf(',');
+        return comma > 0 ? line.substring(0, comma) : "";
     }
 
-    /** 粗略过滤：5 个字段、三个 ID 和时间戳是数字。 */
+    /**
+     * 粗略过滤。
+     *
+     * <p>字段数必须是 9；三个 ID 必须是整数；price 必须是数字；
+     * 第 1 列必须像时间戳（用来顺手过滤掉 CSV 的表头行）。
+     *
+     * <p>更严格的校验（时间范围、行为类型枚举）留给 Flink 清洗层做 ——
+     * 生产者只做便宜的检查，避免成为吞吐瓶颈。
+     */
     private static boolean looksValid(String line) {
         String[] f = line.split(",");
-        if (f.length != 5) {
+        if (f.length != 9) {
             return false;
         }
-        return isDigits(f[0]) && isDigits(f[1]) && isDigits(f[2]) && isDigits(f[4]);
+        // 第 1 列形如 2019-11-01 00:00:00 UTC，表头是 "event_time"，这里会被挡掉
+        String t = f[0];
+        if (t.length() < 19 || !Character.isDigit(t.charAt(0)) || t.charAt(4) != '-') {
+            return false;
+        }
+        return isDigits(f[2])                  // product_id
+                && isDigits(f[3])              // category_id
+                && isDigits(f[7])              // user_id
+                && isNumeric(f[6]);            // price
+    }
+
+    /** 整数或小数都可（price 带小数点）。 */
+    private static boolean isNumeric(String s) {
+        if (s.isEmpty()) {
+            return false;
+        }
+        int dots = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '.') {
+                dots++;
+            } else if (!Character.isDigit(c)) {
+                return false;
+            }
+        }
+        return dots <= 1;
     }
 
     private static boolean isDigits(String s) {

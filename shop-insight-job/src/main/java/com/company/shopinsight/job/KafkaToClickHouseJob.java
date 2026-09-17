@@ -36,32 +36,48 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * Kafka -> Flink（清洗 + 窗口聚合）-> ClickHouse。
+ * Kafka → Flink（清洗 + 窗口聚合）→ ClickHouse。
  *
- * <p>一条输入流分两个出口：
- * <ul>
- *   <li><b>明细</b>：清洗后写入 {@code dwd_user_behavior}</li>
- *   <li><b>窗口指标</b>：滚动窗口聚合后写入 {@code ads_realtime_pv_uv}</li>
- * </ul>
+ * <p>数据源：数据集1（eCommerce behavior data from multi category store）
+ * <pre>
+ * event_time,event_type,product_id,category_id,category_code,brand,price,user_id,user_session
+ * 2019-11-01 00:00:00 UTC,view,1003461,2053013555631882655,electronics.smartphone,xiaomi,489.07,520088904,4d3b30da-...
+ * </pre>
  *
- * <p>输入格式（UserBehavior.csv 的行）：{@code user_id,item_id,category_id,behavior,timestamp}
+ * <p>一条输入流分四个出口：
+ * <ol>
+ *   <li><b>明细</b> → {@code dwd_user_behavior}</li>
+ *   <li><b>全局窗口</b> → {@code ads_realtime_pv_uv}</li>
+ *   <li><b>分类目窗口</b> → {@code ads_realtime_category_stats}</li>
+ *   <li><b>分品牌窗口</b> → {@code ads_realtime_brand_stats}</li>
+ * </ol>
  *
- * <p><b>时间语义</b>：用事件时间（Event Time）而不是处理时间。窗口按数据自带的时间戳
- * 划分，所以回放历史数据也能得到正确的窗口结果 —— 这是 Flink 的核心能力之一。
+ * <p>后三个必须各自独立计算，不能从全局结果派生 —— 因为 UV 是去重计数，
+ * 一个用户可能访问多个类目/品牌，各部分 UV 之和 ≠ 全局 UV。
  */
 public class KafkaToClickHouseJob {
 
-    private static final ZoneId BUSINESS_ZONE = ZoneId.of("Asia/Shanghai");
+    /** 源数据是 UTC，且是面向多国用户的商城，所以统一用 UTC，不转本地时区。 */
+    private static final ZoneId SOURCE_ZONE = ZoneId.of("UTC");
+
     private static final DateTimeFormatter TS_FMT =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(BUSINESS_ZONE);
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(SOURCE_ZONE);
     private static final DateTimeFormatter DATE_FMT =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(BUSINESS_ZONE);
+            DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(SOURCE_ZONE);
 
-    private static final Set<String> VALID_BEHAVIORS = Set.of("pv", "fav", "cart", "buy");
+    private static final Set<String> VALID_EVENT_TYPES = Set.of("view", "cart", "purchase");
 
-    /** 时段外的时间戳视为脏数据。数据集是 2017-11-25 ~ 12-03，放宽到整个 2017 年。 */
-    private static final long MIN_TS = 1483228800L; // 2017-01-01
-    private static final long MAX_TS = 1514764800L; // 2018-01-01
+    /** 源数据里空的分类/品牌字段统一填这个值，让聚合不用处理 NULL。 */
+    private static final String UNKNOWN = "unknown";
+
+    private static final String DWD_TABLE = "dwd_user_behavior";
+    private static final String GLOBAL_TABLE = "ads_realtime_pv_uv";
+    private static final String CATEGORY_TABLE = "ads_realtime_category_stats";
+    private static final String BRAND_TABLE = "ads_realtime_brand_stats";
+
+    /** 事件时间的合理范围：源数据是 2019-10-01 ~ 2019-11-30，放宽到整个 2019 年。 */
+    private static final long MIN_TS = 1546300800000L; // 2019-01-01 UTC
+    private static final long MAX_TS = 1577836800000L; // 2020-01-01 UTC
 
     public static void main(String[] args) throws Exception {
         String bootstrapServers = arg(args, 0, "kafka:29092");
@@ -70,10 +86,7 @@ public class KafkaToClickHouseJob {
         String clickHouseUser = arg(args, 3, "shop_insight");
         String clickHousePassword = arg(args, 4, "shop_insight");
         String clickHouseDatabase = arg(args, 5, "shop_insight");
-        String dwdTable = arg(args, 6, "dwd_user_behavior");
-        String adsTable = arg(args, 7, "ads_realtime_pv_uv");
-        long windowMinutes = Long.parseLong(arg(args, 8, "1"));
-        String adsCategoryTable = arg(args, 9, "ads_realtime_category_stats");
+        long windowMinutes = Long.parseLong(arg(args, 6, "1"));
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
@@ -85,8 +98,8 @@ public class KafkaToClickHouseJob {
                 .setBootstrapServers(bootstrapServers)
                 .setTopics(topic)
                 .setGroupId("shop-insight-kafka-to-clickhouse")
-                // 从上次提交的 offset 接着读；首次运行（没有提交记录）才从头读。
-                // 之前用 earliest() 是作业一重启就从头重读，会把数据写重。
+                // 从上次提交的 offset 接着读；首次运行才从头读。
+                // 用 earliest() 的话每次重启都会从头重读、把数据写重。
                 .setStartingOffsets(OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST))
                 .setValueOnlyDeserializer(new SimpleStringSchema())
                 .build();
@@ -98,39 +111,43 @@ public class KafkaToClickHouseJob {
                 .name("parse-and-clean")
                 .assignTimestampsAndWatermarks(
                         WatermarkStrategy.<BehaviorEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
-                                .withTimestampAssigner((event, previousTs) -> event.eventTs * 1000L))
+                                .withTimestampAssigner((event, previousTs) -> event.eventTs))
                 .name("event-time-watermark");
 
-        // 出口 1：明细落 dwd
+        // 出口 1：明细
         events
                 .map(new ToDwdCsv())
                 .name("to-dwd-csv")
-                .sinkTo(clickHouseSink(clickHouseUrl, clickHouseUser, clickHousePassword,
-                        clickHouseDatabase, dwdTable))
+                .sinkTo(sink(clickHouseUrl, clickHouseUser, clickHousePassword, clickHouseDatabase, DWD_TABLE))
                 .name("dwd-sink");
 
-        // 出口 2：全局窗口聚合（总览页面用）
-        events
-                .windowAll(TumblingEventTimeWindows.of(Duration.ofMinutes(windowMinutes)))
-                .aggregate(new PvUvAggregate(), new WindowToAdsCsv())
-                .name("pv-uv-window")
-                .sinkTo(clickHouseSink(clickHouseUrl, clickHouseUser, clickHousePassword,
-                        clickHouseDatabase, adsTable))
-                .name("ads-sink");
+        Duration windowSize = Duration.ofMinutes(windowMinutes);
 
-        // 出口 3：按类目的窗口聚合（类目分析页面用）
-        //
-        // 为什么要单独算而不是把全局结果按类目拆开：UV 是【去重计数】，
-        // 一个用户可能访问多个类目，各类目 UV 之和 ≠ 全局 UV。
-        // 所以两者必须各自独立地从原始事件流计算。
+        // 出口 2：全局窗口
+        events
+                .windowAll(TumblingEventTimeWindows.of(windowSize))
+                .aggregate(new PvUvAggregate(), new WindowToGlobalCsv())
+                .name("global-window")
+                .sinkTo(sink(clickHouseUrl, clickHouseUser, clickHousePassword, clickHouseDatabase, GLOBAL_TABLE))
+                .name("global-sink");
+
+        // 出口 3：分类目窗口
         events
                 .keyBy(new CategoryKeySelector())
-                .window(TumblingEventTimeWindows.of(Duration.ofMinutes(windowMinutes)))
+                .window(TumblingEventTimeWindows.of(windowSize))
                 .aggregate(new PvUvAggregate(), new WindowToCategoryCsv())
-                .name("category-pv-uv-window")
-                .sinkTo(clickHouseSink(clickHouseUrl, clickHouseUser, clickHousePassword,
-                        clickHouseDatabase, adsCategoryTable))
-                .name("ads-category-sink");
+                .name("category-window")
+                .sinkTo(sink(clickHouseUrl, clickHouseUser, clickHousePassword, clickHouseDatabase, CATEGORY_TABLE))
+                .name("category-sink");
+
+        // 出口 4：分品牌窗口 —— 品牌是数据里最接近「商家」的实体
+        events
+                .keyBy(new BrandKeySelector())
+                .window(TumblingEventTimeWindows.of(windowSize))
+                .aggregate(new PvUvAggregate(), new WindowToBrandCsv())
+                .name("brand-window")
+                .sinkTo(sink(clickHouseUrl, clickHouseUser, clickHousePassword, clickHouseDatabase, BRAND_TABLE))
+                .name("brand-sink");
 
         env.execute("ShopInsight Kafka->ClickHouse");
     }
@@ -146,7 +163,6 @@ public class KafkaToClickHouseJob {
         checkpointConfig.setMinPauseBetweenCheckpoints(5_000);
         checkpointConfig.setCheckpointTimeout(60_000);
         checkpointConfig.setMaxConcurrentCheckpoints(1);
-        // 取消作业时保留 checkpoint，否则每次改代码重跑都相当于从头开始
         checkpointConfig.setExternalizedCheckpointRetention(
                 ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION);
     }
@@ -154,8 +170,7 @@ public class KafkaToClickHouseJob {
     /**
      * 重启策略。
      *
-     * <p>注意：Flink 2.x <b>移除了</b> {@code env.setRestartStrategy(...)}，
-     * 只能通过 Configuration 配。
+     * <p>注意：Flink 2.x 移除了 {@code env.setRestartStrategy(...)}，只能通过 Configuration 配。
      */
     private static void configureRestartStrategy(StreamExecutionEnvironment env) {
         Configuration conf = new Configuration();
@@ -165,7 +180,7 @@ public class KafkaToClickHouseJob {
         env.configure(conf);
     }
 
-    private static ClickHouseAsyncSink<String> clickHouseSink(
+    private static ClickHouseAsyncSink<String> sink(
             String url, String user, String password, String database, String table) {
 
         ClickHouseClientConfig clientConfig =
@@ -183,14 +198,17 @@ public class KafkaToClickHouseJob {
     }
 
     // -------------------------------------------------------------------------
-    // 算子
+    // 解析清洗
     // -------------------------------------------------------------------------
 
     /**
      * 解析并清洗。脏数据直接丢弃，不报错、不中断作业。
      *
-     * <p>丢弃规则：字段数不是 5 / ID 或时间戳不是数字 / 行为类型不在枚举内 /
-     * 时间戳超出 2017 年。
+     * <p>丢弃规则：字段数不是 9 / 时间解析失败 / 时间超出 2019 年 /
+     * 行为类型不在 view/cart/purchase 之内。
+     *
+     * <p>不做丢弃但会规整的：category_code 和 brand 为空时填 {@code unknown}，
+     * 因为这两个字段本身就有 32% / 14.5% 的空值，是数据的正常特征而不是脏数据。
      */
     static class ParseAndClean implements FlatMapFunction<String, BehaviorEvent> {
 
@@ -207,57 +225,51 @@ public class KafkaToClickHouseJob {
             }
 
             String[] f = line.split(",");
-            if (f.length != 5) {
+            if (f.length != 9) {
                 return;
             }
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < 9; i++) {
                 f[i] = f[i].trim();
             }
 
-            if (!isDigits(f[0]) || !isDigits(f[1]) || !isDigits(f[2]) || !isDigits(f[4])) {
-                return;
-            }
-            if (!VALID_BEHAVIORS.contains(f[3])) {
+            if (!VALID_EVENT_TYPES.contains(f[1])) {
                 return;
             }
 
-            long ts;
-            try {
-                ts = Long.parseLong(f[4]);
-            } catch (NumberFormatException e) {
-                return;
-            }
+            long ts = BehaviorEvent.parseSourceTime(f[0]);
             if (ts < MIN_TS || ts > MAX_TS) {
                 return;
             }
 
+            long productId;
+            long categoryId;
+            long userId;
+            double price;
             try {
-                out.collect(new BehaviorEvent(
-                        Long.parseLong(f[0]),
-                        Long.parseLong(f[1]),
-                        Long.parseLong(f[2]),
-                        f[3],
-                        ts));
+                productId = Long.parseLong(f[2]);
+                categoryId = Long.parseLong(f[3]);
+                price = Double.parseDouble(f[6]);
+                userId = Long.parseLong(f[7]);
             } catch (NumberFormatException e) {
-                // ID 超出 long 范围，丢弃
+                return;
             }
-        }
 
-        private static boolean isDigits(String s) {
-            if (s.isEmpty()) {
-                return false;
-            }
-            for (int i = 0; i < s.length(); i++) {
-                if (!Character.isDigit(s.charAt(i))) {
-                    return false;
-                }
-            }
-            return true;
+            BehaviorEvent event = new BehaviorEvent();
+            event.eventTs = ts;
+            event.eventType = f[1];
+            event.productId = (int) productId;
+            event.categoryId = categoryId;
+            event.categoryCode = f[4].isEmpty() ? UNKNOWN : f[4];
+            event.brand = f[5].isEmpty() ? UNKNOWN : f[5];
+            event.price = price;
+            event.userId = (int) userId;
+            event.sessionId = f[8];
+            out.collect(event);
         }
     }
 
     /**
-     * 输出 dwd 表的 7 列 CSV。
+     * 输出 dwd 表的 10 列 CSV。
      *
      * <p>为什么派生列要在这里算：连接器以 {@code INSERT INTO t FORMAT CSV} 写入
      * （不带列名），这种形式 ClickHouse 要求提供全部列，DEFAULT 列也得给。
@@ -268,40 +280,58 @@ public class KafkaToClickHouseJob {
 
         @Override
         public String map(BehaviorEvent e) {
-            Instant instant = Instant.ofEpochSecond(e.eventTs);
+            Instant instant = Instant.ofEpochMilli(e.eventTs);
             return String.join(",",
-                    String.valueOf(e.userId),
-                    String.valueOf(e.itemId),
+                    TS_FMT.format(instant),     // event_time
+                    e.eventType,
+                    String.valueOf(e.productId),
                     String.valueOf(e.categoryId),
-                    e.behavior,
-                    String.valueOf(e.eventTs),
-                    TS_FMT.format(instant),
-                    DATE_FMT.format(instant));
+                    e.categoryCode,
+                    e.brand,
+                    String.valueOf(e.price),
+                    String.valueOf(e.userId),
+                    e.sessionId,
+                    DATE_FMT.format(instant));  // event_date
         }
     }
+
+    // -------------------------------------------------------------------------
+    // 窗口聚合
+    // -------------------------------------------------------------------------
 
     /**
      * 窗口聚合的累加器。
      *
-     * <p>口径定义：{@code pv} = 窗口内 behavior='pv' 的事件数；
-     * {@code users} = 做过浏览的独立用户（即 UV）；{@code buyCnt} = 购买事件数。
+     * <p>口径：{@code pv} = 窗口内 view 事件数；{@code users} = 做过浏览的独立用户（UV）；
+     * {@code purchaseCnt} / {@code gmv} = 购买事件数与成交额。
      */
     public static class PvUvAccumulator implements Serializable {
         private static final long serialVersionUID = 1L;
 
         public long pv;
-        public long buyCnt;
+        public long purchaseCnt;
+        public double gmv;
         /**
          * 用 Set 存 user_id 来算 UV。
          *
-         * <p>这是个权衡：单窗口内去重准，但状态会随窗口内用户数增长。
-         * 用户量大时应该换成 HyperLogLog 之类的近似去重（ClickHouse 的 uniq 就是这么做的），
-         * 代价是结果有约 1% 误差、换来状态大小可控。
+         * <p>权衡：窗口内去重精确，但状态随窗口内用户数增长。用户量大时应该换成
+         * HyperLogLog 之类的近似去重，代价是约 1% 误差、换来状态大小可控。
          */
-        public Set<Long> users = new HashSet<>();
+        public Set<Integer> users = new HashSet<>();
+
+        /**
+         * 窗口是否完全为空。
+         *
+         * <p><b>注意不能只看 pv。</b> 曾经写成 {@code if (acc.pv == 0) return;}，
+         * 结果把「只有购买、没有浏览」的窗口整条丢掉了 —— 单个品牌很容易出现
+         * 这种情况（用户直接从购物车下单，不经过浏览）。实测导致分品牌 GMV
+         * 比全局少 3.4%，而 PV 却完全对得上，正是这个原因。
+         */
+        public boolean isEmpty() {
+            return pv == 0 && purchaseCnt == 0;
+        }
     }
 
-    /** 窗口内聚合 PV / UV / 购买数。 */
     public static class PvUvAggregate
             implements AggregateFunction<BehaviorEvent, PvUvAccumulator, PvUvAccumulator> {
 
@@ -314,14 +344,20 @@ public class KafkaToClickHouseJob {
 
         @Override
         public PvUvAccumulator add(BehaviorEvent event, PvUvAccumulator acc) {
-            // PV 和 UV 只统计 behavior='pv' 的事件。
-            // 这里踩过一次坑：原本写成了无条件 acc.pv++，结果窗口的 pv 等于
-            // 窗口内的「总事件数」而不是浏览量，跟明细表对不上。
-            if ("pv".equals(event.behavior)) {
-                acc.pv++;
-                acc.users.add(event.userId);
-            } else if ("buy".equals(event.behavior)) {
-                acc.buyCnt++;
+            // PV 和 UV 只统计 view 事件，不是全部事件。
+            // 之前踩过坑：写成无条件自增，结果 pv 变成了窗口内的事件总数。
+            switch (event.eventType) {
+                case "view" -> {
+                    acc.pv++;
+                    acc.users.add(event.userId);
+                }
+                case "purchase" -> {
+                    acc.purchaseCnt++;
+                    acc.gmv += event.price;
+                }
+                default -> {
+                    // cart 只影响 pv/purchase 之外的统计，当前窗口指标用不到
+                }
             }
             return acc;
         }
@@ -334,9 +370,33 @@ public class KafkaToClickHouseJob {
         @Override
         public PvUvAccumulator merge(PvUvAccumulator a, PvUvAccumulator b) {
             a.pv += b.pv;
-            a.buyCnt += b.buyCnt;
+            a.purchaseCnt += b.purchaseCnt;
+            a.gmv += b.gmv;
             a.users.addAll(b.users);
             return a;
+        }
+    }
+
+    /** 全局窗口结果 → CSV。 */
+    public static class WindowToGlobalCsv
+            extends ProcessAllWindowFunction<PvUvAccumulator, String, TimeWindow> {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public void process(Context context, Iterable<PvUvAccumulator> elements, Collector<String> out) {
+            PvUvAccumulator acc = elements.iterator().next();
+            if (acc.isEmpty()) {
+                return;
+            }
+            TimeWindow window = context.window();
+            out.collect(String.join(",",
+                    TS_FMT.format(Instant.ofEpochMilli(window.getStart())),
+                    TS_FMT.format(Instant.ofEpochMilli(window.getEnd())),
+                    String.valueOf(acc.pv),
+                    String.valueOf(acc.users.size()),
+                    String.valueOf(acc.purchaseCnt),
+                    String.valueOf(acc.gmv)));
         }
     }
 
@@ -356,28 +416,19 @@ public class KafkaToClickHouseJob {
         }
     }
 
-    /**
-     * 把窗口元信息和分类目聚合结果拼成 CSV。
-     *
-     * <p>和 {@link WindowToAdsCsv} 的区别：这是 keyed window，
-     * 每个 key（类目）各有一份窗口，所以要从 key 参数拿到 category_id，
-     * 输出多一列。
-     */
+    /** 分类目窗口结果 → CSV。 */
     public static class WindowToCategoryCsv
             extends ProcessWindowFunction<PvUvAccumulator, String, Long, TimeWindow> {
 
         private static final long serialVersionUID = 1L;
 
         @Override
-        public void process(Long categoryId,
-                            Context context,
-                            Iterable<PvUvAccumulator> elements,
-                            Collector<String> out) {
+        public void process(Long categoryId, Context context,
+                            Iterable<PvUvAccumulator> elements, Collector<String> out) {
             PvUvAccumulator acc = elements.iterator().next();
-            if (acc.pv == 0) {
+            if (acc.isEmpty()) {
                 return;
             }
-
             TimeWindow window = context.window();
             out.collect(String.join(",",
                     TS_FMT.format(Instant.ofEpochMilli(window.getStart())),
@@ -385,32 +436,44 @@ public class KafkaToClickHouseJob {
                     String.valueOf(categoryId),
                     String.valueOf(acc.pv),
                     String.valueOf(acc.users.size()),
-                    String.valueOf(acc.buyCnt)));
+                    String.valueOf(acc.purchaseCnt),
+                    String.valueOf(acc.gmv)));
         }
     }
 
-    /** 把窗口元信息（起止时间）和聚合结果拼成 ads 表的 CSV。 */
-    public static class WindowToAdsCsv
-            extends ProcessAllWindowFunction<PvUvAccumulator, String, TimeWindow> {
+    /** 按品牌分组。 */
+    static class BrandKeySelector implements KeySelector<BehaviorEvent, String> {
 
         private static final long serialVersionUID = 1L;
 
         @Override
-        public void process(Context context,
-                            Iterable<PvUvAccumulator> elements,
-                            Collector<String> out) {
+        public String getKey(BehaviorEvent event) {
+            return event.brand;
+        }
+    }
+
+    /** 分品牌窗口结果 → CSV。 */
+    public static class WindowToBrandCsv
+            extends ProcessWindowFunction<PvUvAccumulator, String, String, TimeWindow> {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public void process(String brand, Context context,
+                            Iterable<PvUvAccumulator> elements, Collector<String> out) {
             PvUvAccumulator acc = elements.iterator().next();
-            if (acc.pv == 0) {
+            if (acc.isEmpty()) {
                 return;
             }
-
             TimeWindow window = context.window();
             out.collect(String.join(",",
                     TS_FMT.format(Instant.ofEpochMilli(window.getStart())),
                     TS_FMT.format(Instant.ofEpochMilli(window.getEnd())),
+                    brand,
                     String.valueOf(acc.pv),
                     String.valueOf(acc.users.size()),
-                    String.valueOf(acc.buyCnt)));
+                    String.valueOf(acc.purchaseCnt),
+                    String.valueOf(acc.gmv)));
         }
     }
 }
