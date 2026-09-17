@@ -1,0 +1,38 @@
+<!--
+  ClickHouse 内存上限修正（服务级）
+
+  ⚠️ 为什么需要这个文件：
+
+  ClickHouse 通过读 /proc/meminfo 判断可用内存。但在 macOS 上，Docker 容器的
+  /proc/meminfo 显示的是 **Docker 虚拟机的总内存**（本机约 11.7 GiB），而不是
+  docker-compose 里给容器设的 mem_limit。
+
+  结果：ClickHouse 按 11.7 GiB 设自己的内存上限（日志里能看到
+  "Merges and mutations memory limit is set to 5.83 GiB"），并发查询时内存峰值
+  冲到 4.37 GiB，远超容器的限制，被 Docker 直接杀掉、容器重启。
+
+  实测：6 个并发聚合查询全部失败（跑满 629 秒后中断）。
+
+  修法：显式告诉 ClickHouse 它的真实上限。
+
+  ⚠️ 注意配置层级：
+     max_server_memory_usage   是【服务级】→ 放这里（config.d）
+     max_memory_usage          是【用户级】→ 必须放 users.d 的 <profiles> 里
+     放错层级 ClickHouse 会启动失败并报 UNKNOWN_ELEMENT_IN_CONFIG。
+
+  当前配比：
+     容器 mem_limit          = 6 GiB      (6144 MiB)
+     max_server_memory_usage = 5.0 GB     (4.66 GiB)
+     留给非统计内存            ≈ 1.3 GiB（线程栈、mmap 等 MemoryTracker 统计不到的）
+
+  预期并发能力（按单条 uniqExact 聚合峰值约 918 MiB 估算）：
+     2.79 GiB 上限 → 2 条并发（改造前实测）
+     4.66 GiB 上限 → 约 5 条并发（待实测验证）
+-->
+<clickhouse>
+    <!--
+      服务端内存使用上限（字节）。超过后查询会被拒绝执行（报 MEMORY_LIMIT_EXCEEDED），
+      而不是让整个进程被 Docker 杀掉 —— 前者是一次查询失败，后者是服务中断。
+    -->
+    <max_server_memory_usage>5000000000</max_server_memory_usage>
+</clickhouse>

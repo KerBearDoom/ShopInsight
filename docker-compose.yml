@@ -121,6 +121,17 @@ services:
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - clickhouse-logs:/var/log/clickhouse-server
+      # 修正 ClickHouse 的内存自检：容器里 /proc/meminfo 显示的是 Docker 虚拟机的
+      # 总内存（约 11.7 GiB），不是本容器的 mem_limit。不覆盖的话并发查询会把
+      # 内存冲到 4 GiB 以上、被 Docker 杀掉。详见该目录内 memory.xml 的说明。
+      #
+      # 注意挂的是【目录】而不是单个文件。单文件 bind mount 绑的是 inode，
+      # 用编辑器改动宿主机上的文件（通常是写临时文件再重命名）会让容器仍指向
+      # 已删除的旧 inode，ClickHouse 启动时报 "File not found"。
+      # 目录挂载没有这个问题。
+      # 因为盖住了整个 config.d，镜像自带的 docker_related_config.xml
+      # 已复制到该目录下一并挂载，否则 listen_host 配置会丢失。
+      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
 
     # ClickHouse 对文件描述符要求较高，不放开会有性能告警
     ulimits:
@@ -128,7 +139,11 @@ services:
         soft: 262144
         hard: 262144
 
-    mem_limit: 2048m
+    # 6 GiB。演进过程：2 GiB（被打爆）→ 3.5 GiB（并发 2 条）→ 6 GiB。
+    # Docker VM 实际有 11.67 GiB，四个容器平时只用约 3.5 GiB，余量充足。
+    # 四个容器限额之和约 10.5 GiB，超过 VM 是刻意的 —— 限额是上限不是预留，
+    # 各容器不会同时打满。
+    mem_limit: 6g
 
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client -u shop_insight --password shop_insight --query 'SELECT 1' >/dev/null 2>&1"]
@@ -137,6 +152,24 @@ services:
       retries: 12
       start_period: 20s
 
+    networks:
+      - shop-insight-net
+
+  # ---------------------------------------------------------------------------
+  # 一次性初始化：修 checkpoint 卷的属主
+  #
+  # 为什么需要它：Flink 镜像以 uid=9999(flink) 运行，而 Docker 在挂载命名卷时
+  # 会把不存在的挂载点建成 root 所有 —— 结果 JobManager 连 checkpoint 目录都建不了，
+  # 报 "Failed to create directory for shared state"。这个容器只跑一次把属主改掉。
+  # ---------------------------------------------------------------------------
+  flink-checkpoint-init:
+    image: apache/flink:2.3.0
+    container_name: shop-insight-flink-init
+    user: root
+    command: ["sh", "-c", "mkdir -p /opt/flink/checkpoints && chown -R 9999:9999 /opt/flink/checkpoints"]
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    restart: "no"
     networks:
       - shop-insight-net
 
@@ -156,6 +189,12 @@ services:
     # 这个官方镜像靠 command 区分角色：jobmanager / taskmanager
     command: jobmanager
 
+    depends_on:
+      # 等 init 容器把 checkpoint 目录的属主改好再启动，
+      # 否则 JobManager 起不来（见上面 flink-checkpoint-init 的说明）
+      flink-checkpoint-init:
+        condition: service_completed_successfully
+
     ports:
       - "8081:8081"   # Web UI，也是提交作业用的 REST 端点
 
@@ -165,6 +204,13 @@ services:
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
         jobmanager.memory.process.size: 1024m
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+
+    volumes:
+      # JobManager 和 TaskManager 挂同一个卷，checkpoint 才能写进去又被读出来。
+      # 不配这个的话 checkpoint 只存在 JobManager 堆内存里，重启就没了 ——
+      # 那开启 checkpoint 就失去意义了。
+      - flink-checkpoints:/opt/flink/checkpoints
 
     mem_limit: 1280m
 
@@ -178,6 +224,7 @@ services:
     command: taskmanager
     depends_on:
       - jobmanager
+      - flink-checkpoint-init
 
     environment:
       - |
@@ -185,6 +232,12 @@ services:
         jobmanager.rpc.address: jobmanager
         taskmanager.numberOfTaskSlots: 4
         taskmanager.memory.process.size: 1536m
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        # TaskManager 挂了自动重连，配合作业层的重启策略一起用
+        taskmanager.slot.timeout: 60s
+
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
 
     # 作业代码（含 Kafka 连接器）以 shaded fat jar 的形式提交，
     # 由 Flink 的 child-first 类加载器加载，不需要额外往 /opt/flink/lib 挂 jar。
@@ -197,6 +250,7 @@ volumes:
   kafka-data:
   clickhouse-data:
   clickhouse-logs:
+  flink-checkpoints:
 
 networks:
   shop-insight-net:
