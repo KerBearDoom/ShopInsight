@@ -1,3 +1,16 @@
 spring:
   application:
     name: shop-insight
+
+server:
+  port: 8080
+
+# ClickHouse 连接配置（自定义配置项，由 ClickHouseConfig 读取）
+# 为什么不用 spring.datasource：项目后续要同时连 ClickHouse 和 MySQL，
+# 两个数据源用独立的 JdbcTemplate 更清晰，避免和 Spring Boot 的单数据源
+# 自动配置纠缠。
+clickhouse:
+  url: jdbc:clickhouse://localhost:8123/shop_insight
+  username: shop_insight
+  password: shop_insight
+  driver-class-name: com.clickhouse.jdbc.ClickHouseDriver
