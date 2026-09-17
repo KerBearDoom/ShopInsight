@@ -6,6 +6,7 @@ import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ExternalizedCheckpointRetention;
 import org.apache.flink.configuration.RestartStrategyOptions;
@@ -20,6 +21,7 @@ import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.windowing.ProcessAllWindowFunction;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
@@ -71,6 +73,7 @@ public class KafkaToClickHouseJob {
         String dwdTable = arg(args, 6, "dwd_user_behavior");
         String adsTable = arg(args, 7, "ads_realtime_pv_uv");
         long windowMinutes = Long.parseLong(arg(args, 8, "1"));
+        String adsCategoryTable = arg(args, 9, "ads_realtime_category_stats");
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
@@ -106,7 +109,7 @@ public class KafkaToClickHouseJob {
                         clickHouseDatabase, dwdTable))
                 .name("dwd-sink");
 
-        // 出口 2：窗口聚合落 ads
+        // 出口 2：全局窗口聚合（总览页面用）
         events
                 .windowAll(TumblingEventTimeWindows.of(Duration.ofMinutes(windowMinutes)))
                 .aggregate(new PvUvAggregate(), new WindowToAdsCsv())
@@ -114,6 +117,20 @@ public class KafkaToClickHouseJob {
                 .sinkTo(clickHouseSink(clickHouseUrl, clickHouseUser, clickHousePassword,
                         clickHouseDatabase, adsTable))
                 .name("ads-sink");
+
+        // 出口 3：按类目的窗口聚合（类目分析页面用）
+        //
+        // 为什么要单独算而不是把全局结果按类目拆开：UV 是【去重计数】，
+        // 一个用户可能访问多个类目，各类目 UV 之和 ≠ 全局 UV。
+        // 所以两者必须各自独立地从原始事件流计算。
+        events
+                .keyBy(new CategoryKeySelector())
+                .window(TumblingEventTimeWindows.of(Duration.ofMinutes(windowMinutes)))
+                .aggregate(new PvUvAggregate(), new WindowToCategoryCsv())
+                .name("category-pv-uv-window")
+                .sinkTo(clickHouseSink(clickHouseUrl, clickHouseUser, clickHousePassword,
+                        clickHouseDatabase, adsCategoryTable))
+                .name("ads-category-sink");
 
         env.execute("ShopInsight Kafka->ClickHouse");
     }
@@ -320,6 +337,55 @@ public class KafkaToClickHouseJob {
             a.buyCnt += b.buyCnt;
             a.users.addAll(b.users);
             return a;
+        }
+    }
+
+    /**
+     * 按类目 ID 分组。
+     *
+     * <p>写成显式类而不是 lambda：lambda 的返回类型可能被推断成 Object，
+     * 导致 Flink 的类型提取失败、退化成 Kryo 序列化。
+     */
+    static class CategoryKeySelector implements KeySelector<BehaviorEvent, Long> {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long getKey(BehaviorEvent event) {
+            return event.categoryId;
+        }
+    }
+
+    /**
+     * 把窗口元信息和分类目聚合结果拼成 CSV。
+     *
+     * <p>和 {@link WindowToAdsCsv} 的区别：这是 keyed window，
+     * 每个 key（类目）各有一份窗口，所以要从 key 参数拿到 category_id，
+     * 输出多一列。
+     */
+    public static class WindowToCategoryCsv
+            extends ProcessWindowFunction<PvUvAccumulator, String, Long, TimeWindow> {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public void process(Long categoryId,
+                            Context context,
+                            Iterable<PvUvAccumulator> elements,
+                            Collector<String> out) {
+            PvUvAccumulator acc = elements.iterator().next();
+            if (acc.pv == 0) {
+                return;
+            }
+
+            TimeWindow window = context.window();
+            out.collect(String.join(",",
+                    TS_FMT.format(Instant.ofEpochMilli(window.getStart())),
+                    TS_FMT.format(Instant.ofEpochMilli(window.getEnd())),
+                    String.valueOf(categoryId),
+                    String.valueOf(acc.pv),
+                    String.valueOf(acc.users.size()),
+                    String.valueOf(acc.buyCnt)));
         }
     }
 

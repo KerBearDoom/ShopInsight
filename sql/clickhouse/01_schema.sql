@@ -127,17 +127,45 @@ ORDER BY event_date;
 
 
 -- -----------------------------------------------------------------------------
--- ADS 层 5：实时 PV/UV（Flink 滑动窗口写入）
+-- ADS 层 5：实时 PV/UV（全局）—— Flink 窗口写入
 --
--- 这张表由 Flink 作业写，不是 Spark 批处理算的。
+-- 用 ReplacingMergeTree 而不是 MergeTree：作业重启后重算同一个窗口时，
+-- 新行会【替换】旧行而不是追加。用普通 MergeTree 时实测产生了 31% 的重复行
+-- （期间反复重启作业调试）。排序键 window_start 相同的行会被合并。
+--
+-- 注意：ReplacingMergeTree 的去重是【后台异步】的，查询时如需精确结果
+-- 要用 SELECT ... FINAL，或对指标取 max()/any() 去重。
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS shop_insight.ads_realtime_pv_uv
 (
-    window_start DateTime COMMENT '窗口开始时间',
-    window_end   DateTime COMMENT '窗口结束时间',
+    window_start DateTime('Asia/Shanghai') COMMENT '窗口开始时间',
+    window_end   DateTime('Asia/Shanghai') COMMENT '窗口结束时间',
     pv           UInt64   COMMENT '窗口内 PV',
     uv           UInt64   COMMENT '窗口内 UV（去重 user_id）',
     buy_cnt      UInt64   COMMENT '窗口内购买数'
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 ORDER BY window_start;
+
+
+-- -----------------------------------------------------------------------------
+-- ADS 层 6：实时 PV/UV（分类目）—— Flink 窗口写入
+--
+-- 为什么要和全局表分开而不是加一列 category_id：
+--   UV 是【去重计数】，不能跨类目相加 —— 一个用户可能访问多个类目，
+--   各类目 UV 之和 ≠ 全局 UV。所以全局和分类目必须各自独立计算。
+--
+-- 这张表让「实时总览」有了经营单元：运营能看到【自己的类目】的实时流量，
+-- 而不只是全站总量。
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS shop_insight.ads_realtime_category_stats
+(
+    window_start DateTime('Asia/Shanghai') COMMENT '窗口开始时间',
+    window_end   DateTime('Asia/Shanghai') COMMENT '窗口结束时间',
+    category_id  UInt32   COMMENT '类目 ID',
+    pv           UInt64   COMMENT '窗口内该类目的 PV',
+    uv           UInt64   COMMENT '窗口内该类目的 UV（去重 user_id）',
+    buy_cnt      UInt64   COMMENT '窗口内该类目的购买数'
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (window_start, category_id);
