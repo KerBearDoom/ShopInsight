@@ -15,10 +15,14 @@ import java.util.Map;
  * <p>数据源是数据集1（eCommerce behavior data），时间戳为 UTC，
  * 所以这里统一按 UTC 格式化输出，不做本地时区转换。
  *
- * <p><b>关于 ReplacingMergeTree 的去重</b>：这几张 ADS 表用的是 ReplacingMergeTree，
- * 作业重启重算同一窗口时新行会替换旧行而不是追加。但它的去重是<strong>后台异步</strong>的，
- * 未合并前查询可能看到重复行。所以这里统一用 {@code GROUP BY 主键 + max()} 取每组最大值，
- * 保证即使有未合并的副本，结果也正确。
+ * <p><b>关于 ReplacingMergeTree 的读取方式</b>：这几张 ADS 表用 ReplacingMergeTree，
+ * 同一个主键被重复写入时保留<strong>最新版本</strong>。它的去重是后台异步的，
+ * 未合并前查询会看到重复行 —— 所以必须加 {@code FINAL} 强制合并后再读。
+ *
+ * <p><b>⚠️ 不要用 {@code GROUP BY 主键 + max()}。</b> 这个写法看起来能去重，
+ * 但取的是<strong>最大值</strong>而不是<strong>最新值</strong>。实测踩过：
+ * 回放生产者每轮把数据映射到「最近」，导致同一个窗口时间被多轮写入不同的值，
+ * 用 max() 读出来的数字比真实值大 38 倍（243,431 vs 6,373）。
  */
 @RestController
 @RequestMapping("/api")
@@ -42,12 +46,9 @@ public class AnalyticsController {
         return clickHouse.queryForList("""
                 SELECT
                     formatDateTime(window_start, ?, 'UTC') AS window_start,
-                    max(pv)           AS pv,
-                    max(uv)           AS uv,
-                    max(purchase_cnt) AS purchase_cnt,
-                    round(max(gmv), 2) AS gmv
-                FROM ads_realtime_pv_uv
-                GROUP BY window_start
+                    pv, uv, purchase_cnt,
+                    round(gmv, 2) AS gmv
+                FROM ads_realtime_pv_uv FINAL
                 ORDER BY window_start DESC
                 LIMIT ?
                 """, TIME_FMT, limit);
@@ -63,13 +64,9 @@ public class AnalyticsController {
         return clickHouse.queryForList("""
                 SELECT
                     formatDateTime(window_start, ?, 'UTC') AS window_start,
-                    category_id,
-                    max(pv)           AS pv,
-                    max(uv)           AS uv,
-                    max(purchase_cnt) AS purchase_cnt,
-                    round(max(gmv), 2) AS gmv
-                FROM ads_realtime_category_stats
-                GROUP BY window_start, category_id
+                    category_id, pv, uv, purchase_cnt,
+                    round(gmv, 2) AS gmv
+                FROM ads_realtime_category_stats FINAL
                 ORDER BY window_start DESC, gmv DESC
                 LIMIT ?
                 """, TIME_FMT, limit);
@@ -86,13 +83,9 @@ public class AnalyticsController {
         return clickHouse.queryForList("""
                 SELECT
                     formatDateTime(window_start, ?, 'UTC') AS window_start,
-                    brand,
-                    max(pv)           AS pv,
-                    max(uv)           AS uv,
-                    max(purchase_cnt) AS purchase_cnt,
-                    round(max(gmv), 2) AS gmv
-                FROM ads_realtime_brand_stats
-                GROUP BY window_start, brand
+                    brand, pv, uv, purchase_cnt,
+                    round(gmv, 2) AS gmv
+                FROM ads_realtime_brand_stats FINAL
                 ORDER BY window_start DESC, gmv DESC
                 LIMIT ?
                 """, TIME_FMT, limit);

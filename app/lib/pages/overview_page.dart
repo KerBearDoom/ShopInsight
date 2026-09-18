@@ -21,7 +21,7 @@ class OverviewPage extends StatefulWidget {
 }
 
 class _OverviewPageState extends State<OverviewPage> {
-  static const _refreshInterval = Duration(seconds: 5);
+  static const _refreshInterval = Duration(seconds: 1);
 
   List<WindowMetric> _data = const [];
   String? _error;

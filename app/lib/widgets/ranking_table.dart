@@ -36,19 +36,27 @@ class RankingTable extends StatelessWidget {
     final rows = <DataRow>[
       for (var i = 0; i < items.length; i++)
         DataRow(cells: [
-          DataCell(Row(children: [
-            SizedBox(
-              width: 22,
-              child: Text('${i + 1}', style: TextStyle(color: p.muted, fontSize: 12.5)),
-            ),
-            Expanded(
-              child: Text(
-                items[i].name,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: p.ink, fontSize: 13),
+          DataCell(Row(
+            // mainAxisSize.min 很重要：DataCell 里的 Row 默认会尝试撑满可用宽度，
+            // 而这张表放在横向滚动容器里、宽度是不定的，会导致 RenderFlex 溢出。
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 22,
+                child: Text('${i + 1}', style: TextStyle(color: p.muted, fontSize: 12.5)),
               ),
-            ),
-          ])),
+              // 不用 Expanded：在横向滚动的 DataTable 里宽度无界，Expanded 算不出尺寸。
+              // 改用有界约束 + 省略号，超长名称会被截断而不是撑破布局。
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 150),
+                child: Text(
+                  items[i].name,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: p.ink, fontSize: 13),
+                ),
+              ),
+            ],
+          )),
           _numCell(compact(items[i].pv), p.ink2),
           if (showUv) _numCell(compact(items[i].uv), p.ink2),
           _numCell(full(items[i].purchaseCnt), p.ink2),

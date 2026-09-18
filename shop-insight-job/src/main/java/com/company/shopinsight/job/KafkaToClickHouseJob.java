@@ -75,9 +75,23 @@ public class KafkaToClickHouseJob {
     private static final String CATEGORY_TABLE = "ads_realtime_category_stats";
     private static final String BRAND_TABLE = "ads_realtime_brand_stats";
 
-    /** 事件时间的合理范围：源数据是 2019-10-01 ~ 2019-11-30，放宽到整个 2019 年。 */
-    private static final long MIN_TS = 1546300800000L; // 2019-01-01 UTC
-    private static final long MAX_TS = 1577836800000L; // 2020-01-01 UTC
+    /**
+     * 事件时间的合理范围。
+     *
+     * <p>刻意放得很宽（2000 ~ 2100 年），原因有两个：
+     * <ol>
+     *   <li>源数据本身是 2019-10 ~ 2019-11，落在这个范围里</li>
+     *   <li><b>回放生产者会平移时间戳</b>（把数据挪到当前时间附近，
+     *       让看板看起来是实时的）。如果这里卡在 2020 年，
+     *       平移后的数据会被<b>全部误杀</b> —— 实测踩过这个坑：
+     *       生产者正常发了 90 万条，窗口数量一个都没涨。</li>
+     * </ol>
+     *
+     * <p>所以这个检查只用来挡明显荒谬的值（1970、2037 这类脏时间戳），
+     * 不是业务时间校验。
+     */
+    private static final long MIN_TS = 946684800000L;  // 2000-01-01
+    private static final long MAX_TS = 4102444800000L; // 2100-01-01
 
     public static void main(String[] args) throws Exception {
         String bootstrapServers = arg(args, 0, "kafka:29092");
@@ -86,7 +100,17 @@ public class KafkaToClickHouseJob {
         String clickHouseUser = arg(args, 3, "shop_insight");
         String clickHousePassword = arg(args, 4, "shop_insight");
         String clickHouseDatabase = arg(args, 5, "shop_insight");
-        long windowMinutes = Long.parseLong(arg(args, 6, "1"));
+
+        // 窗口宽度分两档 —— 这是被实测逼出来的设计。
+        //
+        // 全局窗口用秒级：它每秒只产出 1 行，让看板 KPI 每秒都在变。
+        // 类目/品牌窗口用分钟级：它们有 691 / 4304 个 key，如果也开秒级窗口，
+        //   每秒要往 ClickHouse 写几千行，sink 吞吐跟不上，作业会持续 lag
+        //   （实测 lag 57 万条、约 70 秒），水位线推不动，窗口反而全都不触发了。
+        //
+        // 换句话说：**窗口宽度决定了输出行数，而输出行数决定了作业能不能跟上。**
+        long globalWindowSeconds = Long.parseLong(arg(args, 6, "1"));
+        long dimensionWindowSeconds = Long.parseLong(arg(args, 7, "60"));
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
@@ -111,7 +135,17 @@ public class KafkaToClickHouseJob {
                 .name("parse-and-clean")
                 .assignTimestampsAndWatermarks(
                         WatermarkStrategy.<BehaviorEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
-                                .withTimestampAssigner((event, previousTs) -> event.eventTs))
+                                .withTimestampAssigner((event, previousTs) -> event.eventTs)
+                                // ★ 必须设空闲超时，否则空闲分区会把水位线卡死。
+                                //
+                                // Flink 的水位线取【所有分区的最小值】。回放生产者只往
+                                // 0 号分区发数据，1/2 分区消费完就空了 —— 它们的时钟停在
+                                // 最后一次读到的位置不动，整体水位线就再也推不过去，
+                                // 之后所有窗口都不触发。
+                                //
+                                // 实测症状：生产者正常每秒一轮，但表里最新窗口停在 4 分钟前
+                                // 不再更新。这是 Kafka + Flink 的经典坑。
+                                .withIdleness(Duration.ofSeconds(10)))
                 .name("event-time-watermark");
 
         // 出口 1：明细
@@ -121,11 +155,12 @@ public class KafkaToClickHouseJob {
                 .sinkTo(sink(clickHouseUrl, clickHouseUser, clickHousePassword, clickHouseDatabase, DWD_TABLE))
                 .name("dwd-sink");
 
-        Duration windowSize = Duration.ofMinutes(windowMinutes);
+        Duration globalWindow = Duration.ofSeconds(globalWindowSeconds);
+        Duration dimensionWindow = Duration.ofSeconds(dimensionWindowSeconds);
 
         // 出口 2：全局窗口
         events
-                .windowAll(TumblingEventTimeWindows.of(windowSize))
+                .windowAll(TumblingEventTimeWindows.of(globalWindow))
                 .aggregate(new PvUvAggregate(), new WindowToGlobalCsv())
                 .name("global-window")
                 .sinkTo(sink(clickHouseUrl, clickHouseUser, clickHousePassword, clickHouseDatabase, GLOBAL_TABLE))
@@ -134,7 +169,7 @@ public class KafkaToClickHouseJob {
         // 出口 3：分类目窗口
         events
                 .keyBy(new CategoryKeySelector())
-                .window(TumblingEventTimeWindows.of(windowSize))
+                .window(TumblingEventTimeWindows.of(dimensionWindow))
                 .aggregate(new PvUvAggregate(), new WindowToCategoryCsv())
                 .name("category-window")
                 .sinkTo(sink(clickHouseUrl, clickHouseUser, clickHousePassword, clickHouseDatabase, CATEGORY_TABLE))
@@ -143,7 +178,7 @@ public class KafkaToClickHouseJob {
         // 出口 4：分品牌窗口 —— 品牌是数据里最接近「商家」的实体
         events
                 .keyBy(new BrandKeySelector())
-                .window(TumblingEventTimeWindows.of(windowSize))
+                .window(TumblingEventTimeWindows.of(dimensionWindow))
                 .aggregate(new PvUvAggregate(), new WindowToBrandCsv())
                 .name("brand-window")
                 .sinkTo(sink(clickHouseUrl, clickHouseUser, clickHousePassword, clickHouseDatabase, BRAND_TABLE))
@@ -190,6 +225,12 @@ public class KafkaToClickHouseJob {
                 .setElementConverter(new ClickHouseConvertor<>(String.class))
                 .setClickHouseClientConfig(clientConfig)
                 .setClickHouseFormat(ClickHouseFormat.CSV)
+                // 攒批参数。默认值面向高吞吐场景（攒很久才刷），
+                // 但这样看板上的数据会「一批一批」地跳 —— 实测每 5-6 秒才更新一次，
+                // 即使窗口本身是每秒产出的。
+                // 调小缓冲时间和批大小，让数据更连续地落库。
+                .setMaxTimeInBufferMS(500)
+                .setMaxBatchSize(200)
                 .build();
     }
 

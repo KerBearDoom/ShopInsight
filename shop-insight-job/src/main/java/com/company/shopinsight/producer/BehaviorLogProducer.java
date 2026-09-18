@@ -7,10 +7,15 @@ import org.apache.kafka.common.serialization.StringSerializer;
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -62,6 +67,14 @@ public class BehaviorLogProducer {
     /** 固定发到 0 号分区，保证流是有序的。理由见 sendBatch 的注释。 */
     private static final int PRODUCER_PARTITION = 0;
 
+    /** 源数据的时间格式（不带时区后缀）。 */
+    private static final DateTimeFormatter SRC_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    /** 输出用的时间格式，与源数据一致。 */
+    private static final DateTimeFormatter TS_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneOffset.UTC);
+
     /**
      * 按第 1 列（event_time）升序。
      *
@@ -76,6 +89,9 @@ public class BehaviorLogProducer {
         String topic = args.length > 2 ? args[2] : "user_behavior_log";
         int ratePerSecond = args.length > 3 ? Integer.parseInt(args[3]) : 2000;
         long maxRecords = args.length > 4 ? Long.parseLong(args[4]) : Long.MAX_VALUE;
+        boolean loopMode = args.length > 5 && Boolean.parseBoolean(args[5]);
+        long roundAdvanceMs = (args.length > 6 ? Long.parseLong(args[6]) : 10) * 60_000L;
+        boolean shiftToNow = args.length > 7 && Boolean.parseBoolean(args[7]);
 
         Path path = Paths.get(csvPath);
         if (!Files.exists(path)) {
@@ -97,49 +113,138 @@ public class BehaviorLogProducer {
             RUNNING.set(false);
         }));
 
-        System.out.printf("生产者启动%n  CSV     : %s%n  Kafka   : %s%n  Topic   : %s%n  速率    : %,d 条/秒%n  上限    : %s%n%n",
+        System.out.printf("生产者启动%n  CSV     : %s%n  Kafka   : %s%n  Topic   : %s%n"
+                        + "  速率    : %,d 条/秒%n  上限    : %s%n  循环模式: %s%n%n",
                 path, bootstrapServers, topic, ratePerSecond,
-                maxRecords == Long.MAX_VALUE ? "不限" : String.format("%,d", maxRecords));
+                maxRecords == Long.MAX_VALUE ? "不限" : String.format("%,d", maxRecords),
+                loopMode ? String.format("开启（每轮时间推进 %d 分钟）", roundAdvanceMs / 60_000) : "关闭");
 
         long sent = 0;
         long skipped = 0;
         long startedAt = System.currentTimeMillis();
 
-        try (KafkaProducer<String, String> producer = new KafkaProducer<>(props);
-             BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+        KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+        BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8);
+        long roundIndex = 0;
 
-            String line;
-            List<String> batch = new ArrayList<>(SORT_BATCH_SIZE);
+        try {
+            while (RUNNING.get()) {
+                long roundStartedAt = System.currentTimeMillis();
+                long roundSent = 0;
+                String line;
+                long roundLimit = (maxRecords == Long.MAX_VALUE) ? Long.MAX_VALUE
+                        : (loopMode ? maxRecords : maxRecords - sent);
 
-            while (RUNNING.get() && sent < maxRecords && (line = reader.readLine()) != null) {
-                if (line.isEmpty()) {
-                    continue;
+                // ── 第一趟：把这一轮的记录读进内存 ──────────────────────
+                //
+                // 为什么要先读完再发，而不是边读边发：
+                // 需要知道这一批的【最大时间戳】才能算平移量，把它映射到「最近」。
+                // 30 万条约 40 MB，放内存里没问题。
+                List<String> roundRecords = new ArrayList<>(4096);
+                long maxSrcTs = 0;
+
+                while (RUNNING.get() && roundRecords.size() < roundLimit
+                        && (line = reader.readLine()) != null) {
+                    if (line.isEmpty()) {
+                        continue;
+                    }
+                    // 只发合法行。脏数据留给 Flink 清洗层处理是另一种选择，
+                    // 但那样测不出清洗规则 —— 那里需要的是「人为构造的脏数据」。
+                    if (!looksValid(line)) {
+                        skipped++;
+                        continue;
+                    }
+                    roundRecords.add(line);
+                    // 源文件是按时间有序的，所以最后一条就是最大时间戳，
+                    // 不用逐条比较
+                    maxSrcTs = parseSourceTime(timeKey(line));
                 }
 
-                // 只发合法行。脏数据留给 Flink 清洗层处理是另一种选择，
-                // 但那样测不出清洗规则 —— 那里需要的是「人为构造的脏数据」，
-                // 而不是数据集自带的这 0.0005%。
-                if (!looksValid(line)) {
-                    skipped++;
-                    continue;
+                // ── 计算本轮的平移量 ────────────────────────────────────
+                //
+                // ★ 这是让看板「数值在动」的关键。
+                //
+                // 每轮读的是文件的【下一段】，所以数据本身就不同（数值在动）；
+                // 再把这一段的末尾平移到「当前时间」，看板上显示的窗口就是新鲜的。
+                //
+                // 早先的实现有两个错误，都踩过：
+                //   1. 每轮从头读 → 每轮发同一批数据 → 数值完全不变
+                //   2. 全文件一个偏移 → 30 天的数据摊在 2 小时里回放，
+                //      Flink 要维护 30 天 × 每分钟窗口的状态，窗口迟迟不触发
+                long roundShift = 0;
+                if ((loopMode || shiftToNow) && maxSrcTs > 0) {
+                    roundShift = System.currentTimeMillis() - maxSrcTs;
                 }
 
-                batch.add(line);
+                // ── 第二趟：平移后发送 ──────────────────────────────────
+                List<String> batch = new ArrayList<>(SORT_BATCH_SIZE);
+                for (String record : roundRecords) {
+                    batch.add(roundShift == 0 ? record : shiftTimestamp(record, roundShift));
+                    if (batch.size() >= SORT_BATCH_SIZE) {
+                        int n = sendBatch(producer, topic, batch);
+                        sent += n;
+                        roundSent += n;
+                        batch.clear();
+                        pace(sent, startedAt, ratePerSecond);
+                    }
+                }
+                if (!batch.isEmpty()) {
+                    int n = sendBatch(producer, topic, batch);
+                    sent += n;
+                    roundSent += n;
+                }
 
-                if (batch.size() >= SORT_BATCH_SIZE) {
-                    sent += sendBatch(producer, topic, batch);
-                    batch.clear();
-                    pace(sent, startedAt, ratePerSecond);
-                    long elapsedSec = Math.max(1, (System.currentTimeMillis() - startedAt) / 1000);
-                    System.out.printf("  已发送 %,d 条（跳过 %,d），平均 %,d 条/秒%n",
-                            sent, skipped, sent / elapsedSec);
+                producer.flush();
+
+                // 每轮限速。
+                //
+                // 注意这里必须按【轮】限速，不能只在「攒够 SORT_BATCH_SIZE」时限速 ——
+                // 每轮只有 maxRecords 条（通常小于 SORT_BATCH_SIZE），那个分支永远不触发，
+                // 结果是生产者全速跑（实测 28 万条/秒），看板上的数字会剧烈跳动。
+                //
+                // 按轮限速后，一轮的时长 = 本轮条数 / 速率。想让数值变化更快就调高速率参数。
+                if (loopMode && !roundRecords.isEmpty()) {
+                    long targetRoundMs = roundRecords.size() * 1000L / Math.max(1, ratePerSecond);
+                    long roundCostMs = System.currentTimeMillis() - roundStartedAt;
+                    long sleepMs = targetRoundMs - roundCostMs;
+                    if (sleepMs > 0) {
+                        try {
+                            Thread.sleep(sleepMs);
+                        } catch (InterruptedException ignored) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
+
+                if (!loopMode) {
+                    break;
+                }
+
+                roundIndex++;
+                long el = Math.max(1, (System.currentTimeMillis() - startedAt) / 1000);
+
+                // roundRecords 没读满 → 碰到文件末尾了
+                if (roundRecords.size() < roundLimit) {
+                    reader.close();
+                    reader = Files.newBufferedReader(path, StandardCharsets.UTF_8);
+                    System.out.printf("%n── 读完一圈 → 回到开头（第 %d 圈的数值将在新时间上重现）"
+                                    + "，累计 %,d 条，平均 %,d 条/秒 ──%n",
+                            roundIndex, sent, sent / el);
+                } else {
+                    System.out.printf("── 第 %d 轮：本轮 %,d 条，累计 %,d 条，平均 %,d 条/秒 "
+                                    + "| 窗口时间落在 %s ──%n",
+                            roundIndex, roundSent, sent, sent / el,
+                            TS_FMT.format(Instant.now()));
+                }
+
+                // 非循环模式下 sent 已达标就退出
+                if (!loopMode && sent >= maxRecords) {
+                    break;
                 }
             }
-
-            if (!batch.isEmpty() && sent < maxRecords) {
-                sent += sendBatch(producer, topic, batch);
-            }
-            producer.flush();
+        } finally {
+            reader.close();
+            producer.close();
         }
 
         long elapsedSec = Math.max(1, (System.currentTimeMillis() - startedAt) / 1000);
@@ -174,6 +279,112 @@ public class BehaviorLogProducer {
     private static String timeKey(String line) {
         int comma = line.indexOf(',');
         return comma > 0 ? line.substring(0, comma) : "";
+    }
+
+    /**
+     * 解析源数据的时间字符串。
+     *
+     * <p>格式是 {@code 2019-11-01 00:00:00 UTC}，先剥掉末尾的 {@code " UTC"}
+     * 再按 UTC 解析成 epoch 毫秒。
+     *
+     * @return epoch 毫秒；解析失败返回 0
+     */
+    private static long parseSourceTime(String raw) {
+        if (raw == null) {
+            return 0;
+        }
+        String s = raw.trim();
+        if (s.endsWith(" UTC")) {
+            s = s.substring(0, s.length() - 4);
+        }
+        try {
+            return LocalDateTime.parse(s, SRC_FMT).toInstant(ZoneOffset.UTC).toEpochMilli();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /**
+     * 把一行的 event_time 平移 [offsetMs] 毫秒。
+     *
+     * <p>这是让看板「动起来」的核心：每轮循环整体推进时间，Flink 就会持续
+     * 产出新的窗口时间，而不是反复重算同一批窗口。
+     *
+     * <p>只改第一列，其余原样保留 —— 避免重新格式化引入 CSV 转义问题。
+     */
+    private static String shiftTimestamp(String line, long offsetMs) {
+        int comma = line.indexOf(',');
+        if (comma <= 0) {
+            return line;
+        }
+        long ts = parseSourceTime(line.substring(0, comma));
+        if (ts <= 0) {
+            return line;
+        }
+        // 保持和源数据一致的格式（含 " UTC" 后缀）
+        return TS_FMT.format(Instant.ofEpochMilli(ts + offsetMs)) + " UTC" + line.substring(comma);
+    }
+
+    /**
+     * 读文件第一条数据的时间戳（跳过表头）。
+     *
+     * @return epoch 毫秒；读不到返回 0
+     */
+    private static long readFirstTimestamp(Path path) {
+        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.isEmpty() || line.startsWith("event_time")) {
+                    continue;
+                }
+                int comma = line.indexOf(',');
+                if (comma > 0) {
+                    long ts = parseSourceTime(line.substring(0, comma));
+                    if (ts > 0) {
+                        return ts;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("  读取首行时间戳失败：" + e.getMessage());
+        }
+        return 0;
+    }
+
+    /**
+     * 读文件最后一条数据的时间戳。
+     *
+     * <p>用 RandomAccessFile 从末尾倒着读一小段，而不是扫全文件 ——
+     * 数据文件有几个 GB，全扫一遍要几十秒。
+     *
+     * @return epoch 毫秒；读不到返回 0
+     */
+    private static long readLastTimestamp(Path path) {
+        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "r")) {
+            long len = raf.length();
+            long pos = Math.max(0, len - 8192);
+            raf.seek(pos);
+            byte[] buf = new byte[(int) (len - pos)];
+            raf.readFully(buf);
+
+            String[] lines = new String(buf, StandardCharsets.UTF_8).split("\n");
+            for (int i = lines.length - 1; i >= 0; i--) {
+                String l = lines[i].trim();
+                if (l.isEmpty() || l.startsWith("event_time")) {
+                    continue;
+                }
+                int comma = l.indexOf(',');
+                if (comma > 0) {
+                    long ts = parseSourceTime(l.substring(0, comma));
+                    if (ts > 0) {
+                        return ts;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("  读取末行时间戳失败：" + e.getMessage());
+        }
+        return 0;
     }
 
     /**
