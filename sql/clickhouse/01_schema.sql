@@ -72,9 +72,9 @@ CREATE TABLE IF NOT EXISTS shop_insight.ads_funnel_daily
     cart_rate    Float64 COMMENT '加购率 = cart / view',
     buy_rate     Float64 COMMENT '购买率 = purchase / view'
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 ORDER BY event_date
-COMMENT '全局转化漏斗，定位流失环节';
+COMMENT '全局转化漏斗，定位流失环节。用 ReplacingMergeTree 让批任务可以反复重跑';
 
 
 -- -----------------------------------------------------------------------------
@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS shop_insight.ads_item_stats
     gmv          Decimal(18, 2) COMMENT '成交额',
     buy_rate     Float64 COMMENT '购买转化率 = purchase / view'
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(event_date)
 ORDER BY (event_date, category_id, product_id);
 
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS shop_insight.ads_category_stats
     gmv           Decimal(18, 2) COMMENT '成交额',
     buy_rate      Float64 COMMENT '购买转化率'
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(event_date)
 ORDER BY (event_date, category_id);
 
@@ -143,7 +143,7 @@ CREATE TABLE IF NOT EXISTS shop_insight.ads_brand_stats
     avg_price    Decimal(10, 2) COMMENT '客单价 = gmv / 购买数',
     buy_rate     Float64 COMMENT '购买转化率'
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(event_date)
 ORDER BY (event_date, brand);
 
@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS shop_insight.ads_active_user_daily
     new_user    UInt64 COMMENT '当日首次出现的用户数',
     session_cnt UInt64 COMMENT '会话数'
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 ORDER BY event_date;
 
 
@@ -222,3 +222,54 @@ CREATE TABLE IF NOT EXISTS shop_insight.ads_realtime_brand_stats
 )
 ENGINE = ReplacingMergeTree
 ORDER BY (window_start, brand);
+
+
+-- -----------------------------------------------------------------------------
+-- ADS 层 9：用户分群（RFM）—— Spark 离线写入
+--
+-- 替代做不了的人口画像（数据集不含性别/年龄/地域）。
+--
+-- 分子段的方式是 **Spark MLlib 的 KMeans 聚类**，不是写死的分位数阈值 ——
+-- 这是 Spark 在这个项目里真正不可替代的地方：
+--   分位数阈值用一条 SQL 就能算，聚类不行。
+--
+-- ⚠️ M（Monetary）是**消费金额**，数据集1 有 price 字段所以是真实金额，
+-- 不是之前淘宝数据集那种「用购买次数代理」的降级方案。
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS shop_insight.ads_user_profile
+(
+    user_id       UInt32   COMMENT '用户 ID',
+    recency_days  Int32    COMMENT 'R：最近一次行为距参考日的天数，越小越活跃',
+    frequency     UInt32   COMMENT 'F：行为总次数',
+    monetary      Decimal(18, 2) COMMENT 'M：消费金额',
+    r_score       UInt8    COMMENT 'R 得分 1-5（5 最好）',
+    f_score       UInt8    COMMENT 'F 得分 1-5',
+    m_score       UInt8    COMMENT 'M 得分 1-5',
+    cluster_id    UInt8    COMMENT 'KMeans 聚出的簇编号',
+    segment       LowCardinality(String) COMMENT '分群名称：高价值 / 潜力 / 流失风险 / 一般保持',
+    computed_at   DateTime('UTC') COMMENT '计算时间'
+)
+ENGINE = ReplacingMergeTree
+ORDER BY user_id
+COMMENT '用户 RFM 分群，由 Spark MLlib KMeans 聚类得出';
+
+
+-- -----------------------------------------------------------------------------
+-- ADS 层 10：留存（按天分批次）—— Spark 离线写入
+--
+-- 形状是「批次 × 第 N 天」的矩阵，不是单日活跃数 —— 所以装不进 ads_active_user_daily。
+--
+-- 为什么必须离线：留存要回答「用户首次出现后，第 N 天还回不回来」，
+-- 需要跨越整段时间的用户维度的矩阵，实时窗口的状态装不下。
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS shop_insight.ads_retention_daily
+(
+    cohort_date    Date    COMMENT '批次日期：用户在这一天首次/重新活跃',
+    day_offset     UInt16  COMMENT '第 N 天（0 = 当天）',
+    cohort_users   UInt32  COMMENT '该批次的用户数',
+    retained_users UInt32  COMMENT '第 N 天仍活跃的用户数',
+    retention_rate Float64 COMMENT '留存率 = retained / cohort'
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (cohort_date, day_offset)
+COMMENT '按首次活跃日期分组的留存矩阵';

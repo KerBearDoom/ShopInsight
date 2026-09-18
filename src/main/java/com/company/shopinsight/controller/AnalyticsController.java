@@ -123,6 +123,26 @@ public class AnalyticsController {
     }
 
     /**
+     * 类目成交额排行（跨窗口汇总）。
+     *
+     * <p>同样不返回 UV —— 理由见 {@link #brandRanking}。
+     */
+    @GetMapping("/category-ranking")
+    public List<Map<String, Object>> categoryRanking(@RequestParam(defaultValue = "10") int limit) {
+        return clickHouse.queryForList("""
+                SELECT
+                    category_id,
+                    sum(pv)           AS pv,
+                    sum(purchase_cnt) AS purchase_cnt,
+                    round(sum(gmv), 2) AS gmv
+                FROM ads_realtime_category_stats FINAL
+                GROUP BY category_id
+                ORDER BY gmv DESC
+                LIMIT ?
+                """, limit);
+    }
+
+    /**
      * 商品成交额排行 —— 直接从明细表算，因为商品维度没有实时窗口表。
      *
      * <p>用明细表而不是窗口表的另一个好处：可以真正做去重（跨窗口的 UV 不可加）。
