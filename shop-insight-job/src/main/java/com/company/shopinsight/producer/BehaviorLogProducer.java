@@ -90,8 +90,13 @@ public class BehaviorLogProducer {
         int ratePerSecond = args.length > 3 ? Integer.parseInt(args[3]) : 2000;
         long maxRecords = args.length > 4 ? Long.parseLong(args[4]) : Long.MAX_VALUE;
         boolean loopMode = args.length > 5 && Boolean.parseBoolean(args[5]);
-        long roundAdvanceMs = (args.length > 6 ? Long.parseLong(args[6]) : 10) * 60_000L;
+        // args[6] 是历史遗留：原本想表达"每轮时间推进 N 分钟"，但从未接进平移逻辑，
+        // 只在启动横幅里打印过。保留这个位置是为了不破坏已经写进文档的命令行，
+        // 但它在代码里不再有任何作用 —— 时间轴速度现在由 args[8] 的 timeScale 控制。
         boolean shiftToNow = args.length > 7 && Boolean.parseBoolean(args[7]);
+        // 时间轴倍速。1.0 = 窗口时间与真实时间 1:1（每秒产出 1 个窗口）；
+        // 2.0 = 时间轴跑两倍快（每秒产出 2 个窗口），而【发数据的速率一点没变】。
+        double timeScale = args.length > 8 ? Double.parseDouble(args[8]) : 1.0;
 
         Path path = Paths.get(csvPath);
         if (!Files.exists(path)) {
@@ -113,11 +118,16 @@ public class BehaviorLogProducer {
             RUNNING.set(false);
         }));
 
-        System.out.printf("生产者启动%n  CSV     : %s%n  Kafka   : %s%n  Topic   : %s%n"
-                        + "  速率    : %,d 条/秒%n  上限    : %s%n  循环模式: %s%n%n",
+        System.out.printf("生产者启动%n  CSV      : %s%n  Kafka    : %s%n  Topic    : %s%n"
+                        + "  速率     : %,d 条/秒%n  %s 循环模式 : %s%n"
+                        + "  时间轴倍速: %.1fx（每秒产出 %.1f 个窗口）%n%n",
                 path, bootstrapServers, topic, ratePerSecond,
-                maxRecords == Long.MAX_VALUE ? "不限" : String.format("%,d", maxRecords),
-                loopMode ? String.format("开启（每轮时间推进 %d 分钟）", roundAdvanceMs / 60_000) : "关闭");
+                loopMode
+                        ? String.format("每轮条数 : %,d%n", maxRecords)
+                        : String.format("上限     : %s%n",
+                                maxRecords == Long.MAX_VALUE ? "不限" : String.format("%,d", maxRecords)),
+                loopMode ? "开启" : "关闭",
+                timeScale, timeScale);
 
         long sent = 0;
         long skipped = 0;
@@ -171,9 +181,27 @@ public class BehaviorLogProducer {
                 //   1. 每轮从头读 → 每轮发同一批数据 → 数值完全不变
                 //   2. 全文件一个偏移 → 30 天的数据摊在 2 小时里回放，
                 //      Flink 要维护 30 天 × 每分钟窗口的状态，窗口迟迟不触发
+                //
+                // ── 关于「怎么让看板的数字跳得更快」────────────────────
+                //
+                // 锚点用 startedAt + 已过时间 × timeScale，而不是直接用「此刻」。
+                // 这样 timeScale 就控制了【窗口时间轴相对真实时间的速度】：
+                // 时间轴走得越快，窗口边界被跨过得越频繁，每秒产出的窗口就越多，
+                // 看板上数字跳得越快。
+                //
+                // ★ 关键区别 —— 这【完全不会】增加数据吞吐：
+                //   每轮发的条数没变、每秒发的轮数没变，Flink 的输入速率一模一样。
+                //   这和「调高速率参数」是两码事：后者会直接把作业压垮，
+                //   实测把速率从 8000 提到 16000，Kafka 就积压了 300 万条、
+                //   水位线推不动、窗口全都不触发了。
+                //
+                // 代价：时间轴会跑到真实时间前面去（2 倍速跑 10 分钟就领先 20 分钟），
+                // 所以趋势图横轴上的时间会比当前时间"超前"。数据本身没问题。
                 long roundShift = 0;
                 if ((loopMode || shiftToNow) && maxSrcTs > 0) {
-                    roundShift = System.currentTimeMillis() - maxSrcTs;
+                    long anchorMs = startedAt
+                            + (long) ((System.currentTimeMillis() - startedAt) * timeScale);
+                    roundShift = anchorMs - maxSrcTs;
                 }
 
                 // ── 第二趟：平移后发送 ──────────────────────────────────
@@ -202,7 +230,13 @@ public class BehaviorLogProducer {
                 // 每轮只有 maxRecords 条（通常小于 SORT_BATCH_SIZE），那个分支永远不触发，
                 // 结果是生产者全速跑（实测 28 万条/秒），看板上的数字会剧烈跳动。
                 //
-                // 按轮限速后，一轮的时长 = 本轮条数 / 速率。想让数值变化更快就调高速率参数。
+                // 按轮限速后，一轮的时长 = 本轮条数 / 速率。
+                //
+                // ⚠️ 速率【不影响】看板数字变化的快慢 —— 它只决定数据灌得多快。
+                // 想让它跳得更快，用的是最后一个参数 timeScale（见上面的平移段）。
+                // 早先这里错写成「想让数值变化更快就调高速率参数」，照着做会把
+                // Flink 压垮而数字并不会变快：速率翻倍后每秒发的轮数翻倍，
+                // 但每轮的锚点仍然是"此刻"，时间轴照样 1:1 走，还是每秒 1 个窗口。
                 if (loopMode && !roundRecords.isEmpty()) {
                     long targetRoundMs = roundRecords.size() * 1000L / Math.max(1, ratePerSecond);
                     long roundCostMs = System.currentTimeMillis() - roundStartedAt;
@@ -234,7 +268,8 @@ public class BehaviorLogProducer {
                     System.out.printf("── 第 %d 轮：本轮 %,d 条，累计 %,d 条，平均 %,d 条/秒 "
                                     + "| 窗口时间落在 %s ──%n",
                             roundIndex, roundSent, sent, sent / el,
-                            TS_FMT.format(Instant.now()));
+                            TS_FMT.format(Instant.ofEpochMilli(startedAt
+                                    + (long) ((System.currentTimeMillis() - startedAt) * timeScale))));
                 }
 
                 // 非循环模式下 sent 已达标就退出

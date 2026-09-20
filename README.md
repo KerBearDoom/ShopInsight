@@ -86,7 +86,7 @@
 | 分析存储 | ClickHouse | 24.3.18.7 | Docker |
 | 离线计算 | Apache Spark（Java API + MLlib） | 4.2.0 | 本地 |
 | 服务端 | Spring Boot | 3.5.15 | 本地 |
-| 展示端 | Flutter / Dart | 3.47.2 | Web / 移动 |
+| 展示端 | Flutter / Dart | 3.47.2 | Web / macOS 桌面（移动端待做） |
 
 ### 两个版本陷阱（踩过）
 
@@ -218,7 +218,7 @@ Kafka ──→ 解析清洗 ──┬──→ 明细      → dwd_user_behavio
 
 **Web 看板**（`src/main/resources/static/index.html`）：单文件、零依赖、手写 SVG 图表。
 
-**Flutter 应用**（`app/`）：5 个页面（实时总览 / 经营分析 / 品牌排行 / 类目排行 / 商品排行），响应式导航（宽屏侧栏、窄屏底栏）。
+**Flutter 应用**（`app/`）：5 个页面（实时总览 / 经营分析 / 品牌排行 / 类目排行 / 商品排行），响应式导航（宽屏侧栏、窄屏底栏）。同一套代码跑 **Web** 和 **macOS 桌面端** —— 因为页面里没有任何平台专有代码，桌面端只是多了一层壳：窗口默认 1280×800、最小宽度锁 900（保证不会退化成窄屏的底部导航布局）。
 
 图表用 `fl_chart`。**没有用 ECharts 的原因**：Flutter 生态里没有活跃维护的 ECharts 组件 —— `flutter_echarts` 包已于 2023 年归档，作者推荐改用原生图表库。
 
@@ -251,6 +251,7 @@ shop-insight/
 - Docker Desktop（运行 Kafka / ClickHouse / Flink）
 - Spark 4.2.0（离线任务用，本地安装）
 - Flutter 3.47.2（展示端用）
+- Xcode（仅 macOS 桌面端需要；实测 Xcode 27.0 + Flutter 3.47.2 可正常构建）
 
 ### 1. 启动基础设施
 
@@ -328,9 +329,18 @@ mvn clean package -DskipTests && java -jar target/shop-insight-0.0.1-SNAPSHOT.ja
 # → http://localhost:8080/           Web 看板
 # → http://localhost:8080/api/overview
 
-# Flutter 应用
+# Flutter 应用 —— Web 端
 cd app && flutter run -d chrome
+
+# Flutter 应用 —— macOS 桌面端
+cd app && flutter run -d macos
+flutter build macos --release        # 打包成可双击的 ShopInsight.app
 ```
+
+> macOS 端首次构建前，`macos/Runner/DebugProfile.entitlements` 和 `Release.entitlements`
+> 里必须有 `com.apple.security.network.client`。macOS 沙盒默认禁止 App 发起网络连接，
+> 缺了它的表现很有迷惑性：**App 能正常启动、界面也正常，但所有接口静默失败**，
+> 每页都是 0 —— 看起来像后端挂了，其实是沙盒拦的。
 
 ---
 
@@ -364,6 +374,7 @@ cd app && flutter run -d chrome
 - [x] Spring Boot REST API（10 个端点）
 - [x] Web 看板
 - [x] Flutter 应用（Web 端，5 个页面）
+- [x] Flutter macOS 桌面端
 - [ ] Flutter Android 端
 - [ ] 调度自动化（cron / Spring `@Scheduled`）
 - [ ] 监控（Prometheus + Grafana）
@@ -377,7 +388,8 @@ cd app && flutter run -d chrome
 |---|---|
 | Spark 读取未并行 | 漏斗任务读取 1.1 亿行用单分区 JDBC，252 秒。加 `numPartitions` + `partitionColumn` 可显著提速 |
 | 离线任务手动触发 | 尚未接入调度，需要手动 `spark-submit` |
-| Flutter 仅 Web 端 | Android 端需要模拟器；macOS 桌面端需要完整 Xcode |
+| Flutter 无移动端 | Android 端需要模拟器。macOS 桌面端已支持（Xcode 27.0 实测可构建） |
+| macOS 端未签名公证 | 本地 ad-hoc 签名，本机可双击运行；拷给别人会被 Gatekeeper 拦，需右键 → 打开 |
 | 无用户人口属性 | 数据集不含性别/年龄/地域，用户画像用 RFM 行为分群替代 |
 
 ---
