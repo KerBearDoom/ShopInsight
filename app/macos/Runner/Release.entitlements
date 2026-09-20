@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!--
+	  出站网络。模板给 Release 的这份比 Debug 还空（连 network.server
+	  都没有），必须显式打开，否则打包出来的 .app 所有接口都取不到数。
+	-->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

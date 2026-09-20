@@ -1,11 +1,11 @@
 {
-    "name": "shop_insight_app",
-    "short_name": "shop_insight_app",
+    "name": "ShopInsight",
+    "short_name": "ShopInsight",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "ShopInsight —— 电商商家经营决策平台",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<!--
+	  出站网络。macOS 沙盒默认禁止 App 发起网络连接，不加这一项时
+	  App 能正常启动、界面也正常，但所有 HTTP 请求会静默失败 ——
+	  表现为每页都是 0 或「取数失败」，极易误判成后端挂了。
+
+	  注意上面那项 network.server 是【入站监听】（Dart VM service 和
+	  热重载要靠它），完全不能替代这里的出站 client。
+	-->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

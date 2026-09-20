@@ -71,6 +71,8 @@ class _HomeShellState extends State<HomeShell> {
       subtitle: '直接从 1.1 亿行明细表计算，含独立访客数',
       nameHeader: '商品 ID',
       showUv: true,
+      // 这个接口是全表聚合，比其他两个排行慢一个量级，明确告诉用户要等
+      loadingHint: '直接从 1.1 亿行明细表聚合，首次出数约需 20 秒',
       fetcher: (limit) => AnalyticsApi.productRanking(limit: limit),
     ),
   ];
