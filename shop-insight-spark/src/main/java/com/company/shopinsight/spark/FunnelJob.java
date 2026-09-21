@@ -35,13 +35,26 @@ import static org.apache.spark.sql.functions.when;
  */
 public class FunnelJob {
 
+    /**
+     * 数据集自身的日期范围，作为**默认**过滤条件。
+     *
+     * <p><b>为什么默认值不能是「全部」</b>：{@code dwd_user_behavior} 里混着两类数据 ——
+     * 原始导入落在 2019-10/11，而回放生产者做了时间戳平移，产生的数据落在 2026 年
+     * （约 1.15 亿条）。
+     *
+     * <p>这个作业原本的默认行为是**不过滤**，当时是对的（跑的时候库里只有干净导入）。
+     * 但回放跑起来之后，不传参数重跑就会把 2026 年的数据算进每日漏斗里。
+     */
+    private static final String DEFAULT_START = "2019-10-01";
+    private static final String DEFAULT_END = "2019-11-30";
+
     public static void main(String[] args) {
-        // 参数：0=ClickHouse URL  1=用户  2=密码  3=起始日期(可选)  4=结束日期(可选)
+        // 参数：0=ClickHouse URL  1=用户  2=密码  3=起始日期  4=结束日期
         String url = args.length > 0 ? args[0] : "jdbc:clickhouse://localhost:8123/shop_insight";
         String user = args.length > 1 ? args[1] : "shop_insight";
         String password = args.length > 2 ? args[2] : "shop_insight";
-        String startDate = args.length > 3 ? args[3] : null;
-        String endDate = args.length > 4 ? args[4] : null;
+        String startDate = args.length > 3 ? args[3] : DEFAULT_START;
+        String endDate = args.length > 4 ? args[4] : DEFAULT_END;
 
         SparkSession spark = SparkSession.builder()
                 .appName("ShopInsight-Funnel")
@@ -50,19 +63,13 @@ public class FunnelJob {
 
         long t0 = System.currentTimeMillis();
 
-        // 日期范围可选。指定了就只算这段 —— 既能小范围验证，也是增量重跑的正常做法。
+        // 日期过滤【默认就生效】，不是可选项 —— 原因见 DEFAULT_START 的说明。
         // 让 ClickHouse 在读取端就过滤掉不需要的分区，而不是全量拉过来再筛。
-        StringBuilder q = new StringBuilder(
-                "SELECT event_date, event_type, user_id, price FROM dwd_user_behavior");
-        if (startDate != null) {
-            q.append(" WHERE event_date >= '").append(startDate).append('\'');
-            if (endDate != null) {
-                q.append(" AND event_date <= '").append(endDate).append('\'');
-            }
-        }
+        String q = "SELECT event_date, event_type, user_id, price FROM dwd_user_behavior"
+                + " WHERE event_date >= '" + startDate + "' AND event_date <= '" + endDate + "'";
 
         System.out.println("[1/3] 从 ClickHouse 读取明细…");
-        System.out.println("      范围：" + (startDate == null ? "全部" : startDate + " ~ " + endDate));
+        System.out.println("      范围：" + startDate + " ~ " + endDate);
         // 只读需要的四个列 —— 明细表有 10 列，少读一列就少传一份数据
         Dataset<Row> df = spark.read()
                 .format("jdbc")

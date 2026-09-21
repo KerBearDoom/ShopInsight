@@ -16,7 +16,7 @@
 | 用户 / 商品 / 类目 / 品牌 | 531 万 / 20.7 万 / 691 / 4,304 |
 | 时间跨度 | 2019-10-01 ~ 2019-11-30（61 天） |
 | 实时链路 | Flink 1 分钟事件时间滚动窗口，按 **3 个维度**聚合（全局 / 类目 / 品牌） |
-| 离线指标 | 转化漏斗、留存矩阵、RFM 用户分群 |
+| 离线指标 | 转化漏斗、留存矩阵、RFM 分群、商品 / 类目 / 品牌维度统计、日活 |
 | 接口 | 10 个 REST 端点 |
 | 展示端 | Web 看板（原生 HTML/SVG）+ Flutter 应用（5 个页面） |
 
@@ -147,15 +147,32 @@ view（浏览） → cart（加购） → purchase（购买）
 | `ads_realtime_category_stats` | 按类目 |
 | `ads_realtime_brand_stats` | 按品牌 |
 
-### 离线指标（Spark 批处理写入）
+### 离线指标
+
+**Spark 批处理写入**（需要跨天、跨用户的多次计算，或 MLlib 聚类）：
+
+| 表 | 内容 | 耗时 |
+|---|---|---|
+| `ads_funnel_daily` | 每日转化漏斗 | 252 秒 |
+| `ads_retention_daily` | 留存矩阵（批次 × 第 N 天） | 39 秒 |
+| `ads_user_profile` | RFM 分群（KMeans 聚类结果） | 177 秒 |
+
+**ClickHouse SQL 写入**（纯 `GROUP BY` 聚合，见 `sql/clickhouse/03_ads_offline_stats.sql`）：
 
 | 表 | 内容 |
 |---|---|
-| `ads_funnel_daily` | 每日转化漏斗 |
-| `ads_retention_daily` | 留存矩阵（批次 × 第 N 天） |
-| `ads_user_profile` | RFM 分群（KMeans 聚类结果） |
-| `ads_item_stats` / `ads_category_stats` / `ads_brand_stats` | 商品 / 类目 / 品牌维度表现 |
-| `ads_active_user_daily` | 每日活跃用户 |
+| `ads_item_stats` | 商品维度：浏览 / 加购 / 购买 / UV / GMV / 转化率 |
+| `ads_category_stats` | 类目维度：同上 + 类目商品数 |
+| `ads_brand_stats` | 品牌维度：同上 + 购买用户数 / 客单价 |
+| `ads_active_user_daily` | 日活：DAU / 各行为 UV / 新增用户 / 会话数 |
+
+> **为什么这两种指标一个用 Spark、一个用 SQL**：商品 / 类目 / 品牌 / 日活这四个指标
+> 全是 `GROUP BY + countIf + uniqExact` 形态，**ClickHouse 一条 SQL 就能算，而且快得多**
+> —— 实测四个合计 **27 秒**，而同样的事在 Spark 上单个作业就要 350 秒以上
+> （还要全量扫 1.1 亿行四遍，单机环境下直接 OOM）。
+>
+> 批处理层并没有因此消失：漏斗 / 留存 / RFM 仍在 Spark 里，其中 **RFM 用 MLlib 做 KMeans 聚类，
+> 那才是 Spark 不可替代的地方** —— 分位数阈值一条 SQL 就能算，聚类不行。
 
 ### 两个表设计决策
 
@@ -311,6 +328,16 @@ java -cp target/shop-insight-job-0.0.1-SNAPSHOT.jar \
 
 ### 5. 运行离线任务
 
+**① ClickHouse SQL 部分**（商品 / 类目 / 品牌 / 日活，约 27 秒）：
+
+```bash
+docker exec -i shop-insight-clickhouse clickhouse-client \
+  -u shop_insight --password shop_insight --multiquery \
+  < sql/clickhouse/03_ads_offline_stats.sql
+```
+
+**② Spark 部分**（漏斗 / 留存 / RFM，合计约 8 分钟）：
+
 ```bash
 cd shop-insight-spark && mvn clean package
 CH_JAR=~/.m2/repository/com/clickhouse/clickhouse-jdbc/0.10.0/clickhouse-jdbc-0.10.0-all.jar
@@ -320,6 +347,10 @@ for JOB in FunnelJob RetentionJob RfmUserProfileJob; do
     --jars "$CH_JAR" target/shop-insight-spark-0.0.1-SNAPSHOT.jar
 done
 ```
+
+> ⚠️ 三种离线任务都**默认只算 2019-10-01 ~ 2019-11-30**。
+> `dwd_user_behavior` 里混着回放生产者时间戳平移产生的 2026 年数据（约 1.15 亿条），
+> 不加日期过滤会把噪声算进去。日期范围可用命令行参数覆盖。
 
 ### 6. 启动服务端与展示端
 
@@ -371,6 +402,7 @@ flutter build macos --release        # 打包成可双击的 ShopInsight.app
 - [x] Checkpoint + 失败恢复
 - [x] 全量数据导入（1.1 亿行）
 - [x] Spark 离线计算（转化漏斗 / 留存 / RFM 分群）
+- [x] 离线维度统计（商品 / 类目 / 品牌 / 日活，ClickHouse SQL）
 - [x] Spring Boot REST API（10 个端点）
 - [x] Web 看板
 - [x] Flutter 应用（Web 端，5 个页面）
@@ -386,8 +418,9 @@ flutter build macos --release        # 打包成可双击的 ShopInsight.app
 
 | 限制 | 说明 |
 |---|---|
-| Spark 读取未并行 | 漏斗任务读取 1.1 亿行用单分区 JDBC，252 秒。加 `numPartitions` + `partitionColumn` 可显著提速 |
-| 离线任务手动触发 | 尚未接入调度，需要手动 `spark-submit` |
+| Spark 读取未并行 | 剩下三个 Spark 作业仍是单分区 JDBC，漏斗任务读取 1.1 亿行要 252 秒。加 `numPartitions` + `partitionColumn` 可显著提速（这正是那四个维度统计从 Spark 改用 ClickHouse SQL 的直接原因之一） |
+| 明细表混着回放数据 | `dwd_user_behavior` 里除 2019 年的原始导入外，还有回放生产者时间戳平移产生的 2026 年数据（约 1.15 亿条，累计 2.29 亿行）。**离线任务必须带日期过滤**，三个 Spark 作业和 SQL 脚本都已默认过滤到 2019-10-01 ~ 2019-11-30 |
+| 离线任务手动触发 | 尚未接入调度，需要手动执行 SQL 或 `spark-submit` |
 | Flutter 无移动端 | Android 端需要模拟器。macOS 桌面端已支持（Xcode 27.0 实测可构建） |
 | macOS 端未签名公证 | 本地 ad-hoc 签名，本机可双击运行；拷给别人会被 Gatekeeper 拦，需右键 → 打开 |
 | 无用户人口属性 | 数据集不含性别/年龄/地域，用户画像用 RFM 行为分群替代 |

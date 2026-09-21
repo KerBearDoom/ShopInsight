@@ -56,10 +56,28 @@ public class RfmUserProfileJob {
     /** 固定随机种子，保证每次跑结果一致（否则每次分群编号会变）。 */
     private static final long SEED = 42L;
 
+    /**
+     * 数据集自身的日期范围，作为**默认**过滤条件。
+     *
+     * <p><b>为什么默认值不能是「全部」</b>：{@code dwd_user_behavior} 里混着两类数据 ——
+     * 原始导入落在 2019-10/11，而回放生产者做了时间戳平移，产生的数据落在 2026 年
+     * （约 1.15 亿条）。
+     *
+     * <p>对这个作业来说后果尤其严重：参考日取的是 {@code max(event_date)}，
+     * 一旦混入回放数据，参考日就变成 2026 年，而所有真实数据都在 2019 ——
+     * <b>所有用户的 R 值会变成 2000 多天，聚类彻底失效</b>。
+     */
+    private static final String DEFAULT_START = "2019-10-01";
+    private static final String DEFAULT_END = "2019-11-30";
+
     public static void main(String[] args) {
         String url = args.length > 0 ? args[0] : "jdbc:clickhouse://localhost:8123/shop_insight";
         String user = args.length > 1 ? args[1] : "shop_insight";
         String password = args.length > 2 ? args[2] : "shop_insight";
+        String startDate = args.length > 3 ? args[3] : DEFAULT_START;
+        String endDate = args.length > 4 ? args[4] : DEFAULT_END;
+        // 所有查询共用的过滤条件（见 DEFAULT_START 的说明）
+        String where = " WHERE event_date >= '" + startDate + "' AND event_date <= '" + endDate + "'";
 
         SparkSession spark = SparkSession.builder()
                 .appName("ShopInsight-RFM")
@@ -72,7 +90,8 @@ public class RfmUserProfileJob {
         // 数据是历史数据（2019 年），"今天"不能用系统时间，要用数据里的最后一天。
         // 否则所有用户的 R 都会变成 2000 多天，分群失去意义。
         System.out.println("[1/5] 确定参考日…");
-        String refDateSql = "SELECT toString(max(event_date)) AS d FROM dwd_user_behavior";
+        System.out.println("      范围：" + startDate + " ~ " + endDate);
+        String refDateSql = "SELECT toString(max(event_date)) AS d FROM dwd_user_behavior" + where;
         Dataset<Row> refRow = read(spark, url, user, password, refDateSql);
         String refDate = refRow.collectAsList().get(0).getString(0);
         System.out.println("      参考日：" + refDate);
@@ -88,8 +107,9 @@ public class RfmUserProfileJob {
                     count() AS frequency,
                     sumIf(price, event_type = 'purchase') AS monetary
                 FROM dwd_user_behavior
+                %s
                 GROUP BY user_id
-                """, refDate);
+                """, refDate, where);
         Dataset<Row> rfm = read(spark, url, user, password, rfmSql)
                 .withColumn("frequency", col("frequency").cast("double"))
                 .withColumn("monetary", col("monetary").cast("double"));

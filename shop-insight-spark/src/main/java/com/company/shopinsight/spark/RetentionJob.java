@@ -38,10 +38,25 @@ import static org.apache.spark.sql.functions.round;
  */
 public class RetentionJob {
 
+    /**
+     * 数据集自身的日期范围，作为**默认**过滤条件。
+     *
+     * <p><b>为什么默认值不能是「全部」</b>：{@code dwd_user_behavior} 里混着两类数据 ——
+     * 原始导入落在 2019-10/11，而回放生产者做了时间戳平移，产生的数据落在 2026 年
+     * （约 1.15 亿条）。
+     *
+     * <p>对这个作业的影响：2026 年的用户活跃对会被算进 cohort，
+     * 留存矩阵直接失真；而且 {@code SELECT DISTINCT} 要去重的行数从 1.1 亿涨到 2.29 亿。
+     */
+    private static final String DEFAULT_START = "2019-10-01";
+    private static final String DEFAULT_END = "2019-11-30";
+
     public static void main(String[] args) {
         String url = args.length > 0 ? args[0] : "jdbc:clickhouse://localhost:8123/shop_insight";
         String user = args.length > 1 ? args[1] : "shop_insight";
         String password = args.length > 2 ? args[2] : "shop_insight";
+        String startDate = args.length > 3 ? args[3] : DEFAULT_START;
+        String endDate = args.length > 4 ? args[4] : DEFAULT_END;
 
         SparkSession spark = SparkSession.builder()
                 .appName("ShopInsight-Retention")
@@ -54,6 +69,7 @@ public class RetentionJob {
         // 先在 ClickHouse 里 DISTINCT 掉同一用户同一天的多条记录，
         // 否则「活跃」会被重复计数，留存率会虚高。
         System.out.println("[1/4] 读取用户-日期对（ClickHouse 端已去重）…");
+        System.out.println("      范围：" + startDate + " ~ " + endDate);
         Dataset<Row> activity = spark.read()
                 .format("jdbc")
                 .option("url", url)
@@ -61,7 +77,9 @@ public class RetentionJob {
                 .option("user", user)
                 .option("password", password)
                 .option("query",
-                        "SELECT DISTINCT user_id, event_date FROM dwd_user_behavior")
+                        "SELECT DISTINCT user_id, event_date FROM dwd_user_behavior"
+                                + " WHERE event_date >= '" + startDate + "'"
+                                + " AND event_date <= '" + endDate + "'")
                 .load()
                 // JDBC 读回来可能带时区，统一成日期再比较，避免 datediff 差一天
                 .withColumn("event_date", col("event_date").cast("date"));
