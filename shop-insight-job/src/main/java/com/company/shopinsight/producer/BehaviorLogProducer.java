@@ -84,9 +84,16 @@ public class BehaviorLogProducer {
     private static final Comparator<String> BY_TIMESTAMP = (a, b) -> timeKey(a).compareTo(timeKey(b));
 
     public static void main(String[] args) throws Exception {
-        String csvPath = args.length > 0 ? args[0] : "/Users/kerbear/Desktop/Project_IV/UserBehavior.csv";
+        // 默认值是【相对路径】—— 早先写的是开发机上的绝对路径
+        // （/Users/kerbear/Desktop/Project_IV/UserBehavior.csv），
+        // 换台机器就不存在，而且那个文件名也不对。
+        //
+        // 现在指向仓库布局里数据集的实际位置：从 shop-insight-job/ 出发往上一级。
+        // 注意本机数据集的目录名是中文的，命令行里记得加引号或转义。
+        // 找不到文件时生产者会打印缺失的绝对路径并退出，不会静默失败。
+        String csvPath = args.length > 0 ? args[0] : "../数据集1/2019-Nov.csv";
         String bootstrapServers = args.length > 1 ? args[1] : "localhost:9092";
-        String topic = args.length > 2 ? args[2] : "user_behavior_log";
+        String topic = args.length > 2 ? args[2] : "user_behavior_log_v2";
         int ratePerSecond = args.length > 3 ? Integer.parseInt(args[3]) : 2000;
         long maxRecords = args.length > 4 ? Long.parseLong(args[4]) : Long.MAX_VALUE;
         boolean loopMode = args.length > 5 && Boolean.parseBoolean(args[5]);
