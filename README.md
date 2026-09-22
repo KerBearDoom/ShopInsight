@@ -253,7 +253,7 @@ shop-insight/
 ├── app/                      Flutter 应用
 ├── sql/clickhouse/           建表脚本
 ├── clickhouse/config.d/      ClickHouse 配置（内存上限修正）
-└── docker-compose.yml        Kafka + ClickHouse + Flink
+└── docker-compose.yml        Kafka + ClickHouse + Flink + API
 ```
 
 > **Spark 为什么独立成模块**：Spark 和 Flink 都捆绑大量第三方库（Netty / Jackson / Scala），放在同一个 Maven 模块里会让编译期 classpath 出现版本冲突。
@@ -279,6 +279,7 @@ docker compose ps
 
 | 容器 | 端口 |
 |---|---|
+| shop-insight-api | **8080（REST API + Web 看板）** |
 | shop-insight-kafka | 9092 |
 | shop-insight-clickhouse | 8123（HTTP）/ 9000（原生） |
 | shop-insight-jobmanager | 8081（Flink Web UI） |
@@ -352,18 +353,41 @@ done
 > `dwd_user_behavior` 里混着回放生产者时间戳平移产生的 2026 年数据（约 1.15 亿条），
 > 不加日期过滤会把噪声算进去。日期范围可用命令行参数覆盖。
 
-### 6. 启动服务端与展示端
+### 6. 启动服务端（+ Web 看板）
+
+服务端就是 `shop-insight-api` 容器，**不需要单独做第 6 步** —— 第 1 步的
+`docker compose up -d` 已经把它拉起来了（和 Kafka / ClickHouse / Flink 一起）。
 
 ```bash
-# 服务端 + Web 看板
-mvn clean package -DskipTests && java -jar target/shop-insight-0.0.1-SNAPSHOT.jar
 # → http://localhost:8080/           Web 看板
 # → http://localhost:8080/api/overview
+```
 
-# Flutter 应用 —— Web 端
+> **8080 一个端口身兼两职**：既是 REST API，也是 Web 看板的静态资源。
+
+**为什么服务端也在容器里、且配置不用改**：`application.yaml` 里 ClickHouse 地址写成了
+`${CLICKHOUSE_URL:jdbc:clickhouse://localhost:8123/...}` —— 默认值给本地开发用，
+compose 里注入环境变量覆盖成服务名 `clickhouse:8123`（容器里的 `localhost` 指向容器自己，
+连不上库）。**同一个 jar 本地跑和容器跑都能用。**
+
+#### 只想要本地 `java -jar` 跑（改动调试时更快）
+
+```bash
+mvn clean package -DskipTests && java -jar target/shop-insight-0.0.1-SNAPSHOT.jar
+```
+
+此时走的是 `application.yaml` 里的默认值 `localhost:8123`，需要宿主机能连到容器映射出来的
+ClickHouse 端口（compose 已经映射了 8123）。
+
+⚠️ 注意两者会**抢 8080**：本地起之前先把容器停掉 `docker compose stop api`。
+
+### 7. 启动 Flutter 展示端（可选）
+
+```bash
+# Web 端
 cd app && flutter run -d chrome
 
-# Flutter 应用 —— macOS 桌面端
+# macOS 桌面端
 cd app && flutter run -d macos
 flutter build macos --release        # 打包成可双击的 ShopInsight.app
 ```

@@ -1,0 +1,44 @@
+# =============================================================================
+# 控制构建上下文大小
+#
+# 不加这个文件的话，docker build 会把整个仓库目录打包传给 daemon ——
+# Flutter 工程带 build 产物有 120MB+、.git 有全部提交历史，
+# 而构建实际只用到 target/ 下的一个 jar。
+# =============================================================================
+
+# 版本控制
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.idea
+*.iml
+*.iws
+*.ipr
+.vscode
+
+# Flutter 展示端（不进后端镜像）
+app
+
+# 文档与数据
+docs
+*.md
+
+# 其他模块的源码（后端镜像用不到）
+shop-insight-job
+shop-insight-spark
+clickhouse
+sql
+mvnw
+mvnw.cmd
+
+# docker 自身
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# ★ target/ 只放行最终 jar。
+#   注意负向规则必须写在正向规则【之后】，否则不生效。
+target/*
+!target/shop-insight-0.0.1-SNAPSHOT.jar

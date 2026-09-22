@@ -9,8 +9,13 @@ server:
 # 为什么不用 spring.datasource：项目后续要同时连 ClickHouse 和 MySQL，
 # 两个数据源用独立的 JdbcTemplate 更清晰，避免和 Spring Boot 的单数据源
 # 自动配置纠缠。
+#
+# 三个值都写成【环境变量 + 默认值】的形式。
+# 默认值就是本地开发的写法，所以 `java -jar` 本地跑时行为完全不变；
+# 容器里由 docker-compose 注入 CLICKHOUSE_URL 覆盖成服务名 ——
+# 因为容器里的 localhost 指向容器自己，连不上 ClickHouse。
 clickhouse:
-  url: jdbc:clickhouse://localhost:8123/shop_insight
-  username: shop_insight
-  password: shop_insight
+  url: ${CLICKHOUSE_URL:jdbc:clickhouse://localhost:8123/shop_insight}
+  username: ${CLICKHOUSE_USER:shop_insight}
+  password: ${CLICKHOUSE_PASSWORD:shop_insight}
   driver-class-name: com.clickhouse.jdbc.ClickHouseDriver

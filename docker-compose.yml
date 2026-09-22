@@ -246,6 +246,47 @@ services:
     networks:
       - shop-insight-net
 
+  # ---------------------------------------------------------------------------
+  # 业务服务层：Spring Boot 后端 + Web 看板
+  #
+  # 8080 一个端口身兼两职 —— 既是 REST API，也是 Web 看板的静态资源。
+  #
+  # ⚠️ 构建前必须先构建 jar：mvn clean package -DskipTests
+  #    （不做多阶段构建，原因写在 Dockerfile 里）
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      args:
+        # 基础镜像写成参数，换下载源或换版本时只改这一行
+        BASE_IMAGE: arm64v8/eclipse-temurin:17-jre-ubi9-minimal
+    image: shop-insight-api:latest
+    container_name: shop-insight-api
+
+    ports:
+      - "8080:8080"
+
+    environment:
+      # ★ 关键：容器里的 localhost 指向容器【自己】，连不上 ClickHouse。
+      #   这里用 compose 的服务名覆盖 application.yaml 里的默认值。
+      #   本地 `java -jar` 跑时不走这段，仍用默认的 localhost，行为不变。
+      CLICKHOUSE_URL: jdbc:clickhouse://clickhouse:8123/shop_insight
+      CLICKHOUSE_USER: shop_insight
+      CLICKHOUSE_PASSWORD: shop_insight
+
+    # 等 ClickHouse 的健康检查真的通过再起 —— 否则后端启动时连不上库
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+    # 后端实测占 300~500MB。JVM 有 -XX:MaxRAMPercentage=75 会自适应这个限额。
+    mem_limit: 768m
+
+    restart: unless-stopped
+
+    networks:
+      - shop-insight-net
+
 volumes:
   kafka-data:
   clickhouse-data:
