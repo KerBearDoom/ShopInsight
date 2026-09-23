@@ -4,6 +4,10 @@ import 'package:flutter/material.dart';
 
 import '../models/metrics.dart';
 import '../theme/app_theme.dart';
+import '../utils/format.dart';
+import '../widgets/charts/hbar_chart.dart';
+import '../widgets/charts/scatter_chart.dart';
+import '../widgets/charts/stacked_hbar.dart';
 import '../widgets/ranking_table.dart';
 
 /// 通用的排行页。品牌 / 类目 / 商品三个页面结构完全一样，
@@ -101,7 +105,81 @@ class _RankingPageState extends State<RankingPage> {
           // 不显示，免得每 10 秒闪一下转圈。
           else if (_items.isEmpty && _loading)
             _LoadingPlaceholder(hint: widget.loadingHint)
-          else
+          else ...[
+            // 三张图各回答一个不同的问题，自上而下：
+            //   条形 → 谁在前面、差距多大
+            //   散点 → 谁「被看了却没买」（一维排行看不出来的）
+            //   堆叠 → 头部集中度如何
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _chartTitle(context, '成交额排行',
+                        '条长按最大值归一化 —— 看差距，不看绝对量'),
+                    const SizedBox(height: 14),
+                    HBarChart(
+                      items: [
+                        for (final it in _items.take(10))
+                          HBarItem(
+                            label: it.name,
+                            value: it.gmv,
+                            valueText: money(it.gmv),
+                            detail: '浏览 ${compact(it.pv)} · 购买 ${full(it.purchaseCnt)}',
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _chartTitle(context, '流量 × 转化率',
+                        '横轴是曝光量，纵轴是购买率 —— 右下角那块是「看了不买」的'),
+                    const SizedBox(height: 14),
+                    ScatterPlotChart(
+                      xUnit: '浏览量',
+                      yUnit: '购买率',
+                      points: [
+                        for (final it in _items)
+                          if (it.pv > 0)
+                            ScatterPoint(
+                              label: it.name,
+                              x: it.pv.toDouble(),
+                              y: it.purchaseCnt / it.pv,
+                            ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _chartTitle(context, '头部集中度',
+                        '前三名拿走了多少成交额 —— 越高说明越依赖爆款'),
+                    const SizedBox(height: 14),
+                    StackedHBar(segments: _concentration()),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+
             Card(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
@@ -112,9 +190,53 @@ class _RankingPageState extends State<RankingPage> {
                 ),
               ),
             ),
+          ],
         ],
       ),
     );
+  }
+
+  /// 标题 + 一句话说明，说明写清楚「这张图该看什么」。
+  Widget _chartTitle(BuildContext context, String title, String desc) {
+    final p = AppPalette.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title,
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: p.ink)),
+        const SizedBox(height: 2),
+        Text(desc, style: TextStyle(fontSize: 12, color: p.ink2)),
+      ],
+    );
+  }
+
+  /// 头部集中度：前三名 + 「其余」四段。
+  ///
+  /// 为什么是 3+1 而不是 Top 10 各占一段 —— 分类色只有 4 个槽位，
+  /// 而且规范明确禁止把颜色循环复用（10 个实体用 4 个颜色，必然撞色）。
+  /// 「其余」本身就是有意义的归并，不是妥协。
+  List<StackSegment> _concentration() {
+    final total = _items.fold<double>(0, (s, e) => s + e.gmv);
+    if (total <= 0) return const [];
+    final segs = <StackSegment>[];
+    for (var i = 0; i < _items.length && i < 3; i++) {
+      segs.add(StackSegment(
+        label: _items[i].name,
+        value: _items[i].gmv,
+        colorIndex: i,
+        detail: money(_items[i].gmv),
+      ));
+    }
+    final rest = total - segs.fold<double>(0, (s, e) => s + e.value);
+    if (_items.length > 3 && rest > 0) {
+      segs.add(StackSegment(
+        label: '其余 ${_items.length - 3} 项',
+        value: rest,
+        colorIndex: 3,
+        detail: money(rest),
+      ));
+    }
+    return segs;
   }
 }
 

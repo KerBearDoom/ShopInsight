@@ -7,6 +7,11 @@ import '../api/analytics_api.dart';
 import '../models/metrics.dart';
 import '../theme/app_theme.dart';
 import '../utils/format.dart';
+import '../widgets/charts/grouped_bar_chart.dart';
+import '../widgets/charts/hbar_chart.dart';
+import '../widgets/charts/multi_line_chart.dart';
+import '../widgets/charts/radar_chart.dart';
+import '../widgets/charts/stacked_hbar.dart';
 
 /// 经营分析页 —— 展示 Spark 离线算出来的三个指标。
 ///
@@ -91,9 +96,15 @@ class _InsightPageState extends State<InsightPage> {
             const SizedBox(height: 18),
             _FunnelCard(rows: _funnel),
             const SizedBox(height: 18),
+            _FunnelTrendSection(rows: _funnel),
+            const SizedBox(height: 18),
             _SegmentCard(segments: _segments),
             const SizedBox(height: 18),
+            _SegmentStructureSection(segments: _segments),
+            const SizedBox(height: 18),
             _RetentionCard(points: _retention),
+            const SizedBox(height: 18),
+            _RetentionVolumeSection(points: _retention),
           ],
         ],
       ),
@@ -462,6 +473,160 @@ class _RetentionCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+// ── 漏斗的趋势视角 ──────────────────────────────────────────────────────
+class _FunnelTrendSection extends StatelessWidget {
+  final List<FunnelRow> rows;
+  const _FunnelTrendSection({required this.rows});
+
+  @override
+  Widget build(BuildContext context) {
+    if (rows.isEmpty) return const SizedBox.shrink();
+
+    // 接口按日期倒序返回，画时间轴要正序
+    final asc = rows.reversed.toList();
+    final dates = [for (final r in asc) r.eventDate];
+
+    return Column(
+      children: [
+        _Section(
+          title: '漏斗三环节的每日变化',
+          desc: '同一天三个量并排 —— 看三环节是同步涨落，还是某一环出了结构性问题',
+          child: GroupedBarChart(
+            categories: dates,
+            series: [
+              BarSeries(
+                name: '浏览',
+                values: [for (final r in asc) r.viewCnt.toDouble()],
+                colorIndex: 0,
+              ),
+              BarSeries(
+                name: '加购',
+                values: [for (final r in asc) r.cartCnt.toDouble()],
+                colorIndex: 1,
+              ),
+              BarSeries(
+                name: '购买',
+                values: [for (final r in asc) r.purchaseCnt.toDouble()],
+                colorIndex: 2,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _Section(
+          title: '转化率趋势',
+          desc: '加购率和购买率都是百分比，同轴可比 —— 刻意不做双轴',
+          child: MultiLineChart(
+            xLabels: dates,
+            series: [
+              LineSeries(
+                name: '加购率',
+                values: [for (final r in asc) r.cartRatePct],
+                colorIndex: 0,
+              ),
+              LineSeries(
+                name: '购买率',
+                values: [for (final r in asc) r.buyRatePct],
+                colorIndex: 1,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── 分群的结构与画像 ────────────────────────────────────────────────────
+class _SegmentStructureSection extends StatelessWidget {
+  final List<UserSegment> segments;
+  const _SegmentStructureSection({required this.segments});
+
+  @override
+  Widget build(BuildContext context) {
+    if (segments.isEmpty) return const SizedBox.shrink();
+
+    // 雷达图只放 3 个分群：4 个分类色在"任意两色都可能被对比"的场景下
+    // 过不了配色验证器的硬门槛（实测橙↔黄正常视力 ΔE 只有 13.7）
+    final top3 = segments.take(3).toList();
+
+    return Column(
+      children: [
+        _Section(
+          title: '分群结构',
+          desc: '各分群的用户数占比 —— 看盘子是由谁构成的',
+          child: StackedHBar(
+            segments: [
+              for (var i = 0; i < segments.length; i++)
+                StackSegment(
+                  label: segments[i].segment,
+                  value: segments[i].users.toDouble(),
+                  colorIndex: i,
+                  detail: '${full(segments[i].users)} 人',
+                ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _Section(
+          title: '分群画像对比',
+          desc: '三个分群在 R / F / M 三个维度上的形状差异',
+          child: RadarCompareChart(
+            axes: const ['R 近度', 'F 频次', 'M 金额'],
+            entities: [
+              for (var i = 0; i < top3.length; i++)
+                RadarEntity(
+                  name: top3[i].segment,
+                  values: [
+                    top3[i].avgRecencyDays,
+                    top3[i].avgFrequency,
+                    top3[i].avgMonetary,
+                  ],
+                  colorIndex: i,
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── 留存的绝对量视角 ────────────────────────────────────────────────────
+class _RetentionVolumeSection extends StatelessWidget {
+  final List<RetentionPoint> points;
+  const _RetentionVolumeSection({required this.points});
+
+  /// 只取几个关键天数 —— 31 根柱子挤在一起反而看不清。
+  static const _keyDays = [0, 1, 3, 7, 14, 30];
+
+  @override
+  Widget build(BuildContext context) {
+    final items = <HBarItem>[];
+    for (final d in _keyDays) {
+      for (final pt in points) {
+        if (pt.dayOffset != d) continue;
+        items.add(HBarItem(
+          label: 'D$d',
+          value: pt.retainedTotal.toDouble(),
+          valueText: full(pt.retainedTotal),
+          detail: '留存率 ${(pt.retentionRate * 100).toStringAsFixed(1)}%'
+              ' · 该批共 ${full(pt.cohortTotal)} 人',
+        ));
+        break;
+      }
+    }
+    if (items.isEmpty) return const SizedBox.shrink();
+
+    return _Section(
+      title: '留存人数衰减',
+      desc: '关键天数的留存人数绝对值 —— 和上面的百分比曲线互补：'
+          '百分比看不出盘子本身有多大',
+      child: HBarChart(items: items),
     );
   }
 }
